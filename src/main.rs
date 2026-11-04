@@ -23,8 +23,9 @@ Usage: auto-display <command>
   apply       Fix the displays now if they are duplicated, with the on-screen card
   setup       Same as apply, without a console (what the watcher starts)
   layout      Apply the layout and scaling now, even if not duplicated
+  swap        Swap sides: the two monitors, or the laptop to the other side of the monitor
   watch       Run the watcher in this session (what the sign-in entry runs)
-  preview [dual|single|error]
+  preview [dual|single|done|error]
               Play the on-screen card with made-up screens; changes nothing";
 
 fn main() {
@@ -48,7 +49,13 @@ fn main() {
             }
         }),
         "layout" => fix::apply_layout().map(|_| ()),
-        "preview" => ui::preview(args.get(1).map(String::as_str).unwrap_or("dual")),        "help" | "-h" | "--help" => {
+        "swap" => fix::arrange(true).map(|a| {
+            if !a.swappable {
+                println!("Nothing to swap with this set of screens.");
+            }
+        }),
+        "preview" => ui::preview(args.get(1).map(String::as_str).unwrap_or("dual")),
+        "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(())
         }

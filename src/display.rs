@@ -269,8 +269,9 @@ fn is_ultrawide(m: &SourceMode) -> bool {
 pub struct Plan {
     /// (mode index, x, y) in physical pixels.
     pub moves: Vec<(usize, i32, i32)>,
-    /// True when the two-monitor side-by-side layout was used, so the order may need swapping.
-    pub dual: bool,
+    /// True when the layout has two sides that could be the wrong way round, so the user should be
+    /// asked whether to swap.
+    pub swappable: bool,
 }
 
 /// Where each source should sit.
@@ -279,8 +280,8 @@ pub struct Plan {
 ///   left-to-right order (or reversing it when `swap` is set). The left one is primary. The laptop
 ///   screen sits below both, centred on the line between them.
 /// - Otherwise: the first external display is primary at (0, 0), other externals follow it to the
-///   right with tops aligned, and the laptop screen sits to the left of the primary with its top edge
-///   halfway down the primary.
+///   right with tops aligned, and the laptop screen sits to the left of them with its top edge halfway
+///   down the primary. With `swap`, the laptop moves to the other side from where it is now.
 pub fn plan_layout(paths: &[PathInfo], modes: &[ModeInfo], swap: bool) -> Plan {
     let mut seen = Vec::new();
     let mut externals = Vec::new();
@@ -311,7 +312,7 @@ pub fn plan_layout(paths: &[PathInfo], modes: &[ModeInfo], swap: bool) -> Plan {
             moves.push((idx, x, bottom));
             x += modes[idx].source_mode().width as i32;
         }
-        return Plan { moves, dual: true };
+        return Plan { moves, swappable: true };
     }
 
     let mut moves = Vec::new();
@@ -320,31 +321,41 @@ pub fn plan_layout(paths: &[PathInfo], modes: &[ModeInfo], swap: bool) -> Plan {
         moves.push((idx, x, 0));
         x += modes[idx].source_mode().width as i32;
     }
+    // Left by default; a swap puts the laptop on the opposite side to where it is now.
+    let laptop_now_right = internals.first().is_some_and(|&i| modes[i].source_mode().x > primary_mode.x);
+    let on_right = swap && !laptop_now_right;
+    let top = primary_mode.height as i32 / 2;
     let mut left = 0i32;
     for &idx in &internals {
-        left -= modes[idx].source_mode().width as i32;
-        moves.push((idx, left, primary_mode.height as i32 / 2));
+        let width = modes[idx].source_mode().width as i32;
+        if on_right {
+            moves.push((idx, x, top));
+            x += width;
+        } else {
+            left -= width;
+            moves.push((idx, left, top));
+        }
     }
-    Plan { moves, dual: false }
+    Plan { moves, swappable: !internals.is_empty() }
 }
 
 #[derive(Debug, Default)]
 pub struct Arrangement {
     pub changed: bool,
-    pub dual: bool,
+    pub swappable: bool,
 }
 
 /// Makes an external display primary and arranges the rest around it (see `plan_layout`).
 pub fn arrange(swap: bool) -> Result<Arrangement> {
     let mut cfg = active()?;
     let plan = plan_layout(&cfg.paths, &cfg.modes, swap);
-    let dual = plan.dual;
+    let swappable = plan.swappable;
     let unchanged = plan.moves.iter().all(|&(i, x, y)| {
         let sm = cfg.modes[i].source_mode();
         sm.x == x && sm.y == y
     });
     if unchanged {
-        return Ok(Arrangement { changed: false, dual });
+        return Ok(Arrangement { changed: false, swappable });
     }
     for (i, x, y) in plan.moves {
         cfg.modes[i].set_position(x, y);
@@ -361,7 +372,7 @@ pub fn arrange(swap: bool) -> Result<Arrangement> {
         },
         "SetDisplayConfig (arrange)",
     )?;
-    Ok(Arrangement { changed: true, dual })
+    Ok(Arrangement { changed: true, swappable })
 }
 
 /// One desktop area as the user sees it. Duplicated monitors share one entry.
@@ -549,7 +560,7 @@ mod tests {
         let mut plan = plan_layout(&paths, &modes, false).moves;
         plan.sort();
         assert_eq!(plan, vec![(0, 1920 - 1920, 1440), (1, 1920, 0), (2, 0, 0)]);
-        assert!(plan_layout(&paths, &modes, false).dual);
+        assert!(plan_layout(&paths, &modes, false).swappable);
     }
 
     #[test]
@@ -559,6 +570,34 @@ mod tests {
         let mut plan = plan_layout(&paths, &modes, true).moves;
         plan.sort();
         assert_eq!(plan, vec![(0, 2560 - 1920, 1440), (1, 0, 0), (2, 2560, 0)]);
+    }
+
+    #[test]
+    fn swap_moves_the_laptop_to_the_other_side_of_the_ultrawide() {
+        let paths = [path(0, 1, true), path(1, 2, false)];
+        // Laptop on the left (the default): swapping puts it on the right.
+        let left = [mode(3840, 2400, -3840, 1080), mode(5120, 2160, 0, 0)];
+        let plan = plan_layout(&paths, &left, true);
+        assert!(plan.swappable);
+        let mut moves = plan.moves;
+        moves.sort();
+        assert_eq!(moves, vec![(0, 5120, 1080), (1, 0, 0)]);
+        // Laptop on the right: swapping puts it back on the left.
+        let right = [mode(3840, 2400, 5120, 1080), mode(5120, 2160, 0, 0)];
+        let mut moves = plan_layout(&paths, &right, true).moves;
+        moves.sort();
+        assert_eq!(moves, vec![(0, -3840, 1080), (1, 0, 0)]);
+        // Without a swap the laptop goes on the left whatever the starting point.
+        let mut moves = plan_layout(&paths, &right, false).moves;
+        moves.sort();
+        assert_eq!(moves, vec![(0, -3840, 1080), (1, 0, 0)]);
+    }
+
+    #[test]
+    fn nothing_to_swap_with_lid_closed_and_one_monitor() {
+        let paths = [path(1, 2, false)];
+        let modes = [ModeInfo::default(), mode(5120, 2160, 0, 0)];
+        assert!(!plan_layout(&paths, &modes, false).swappable);
     }
 
     #[test]

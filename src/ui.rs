@@ -91,41 +91,34 @@ pub fn run() -> Result<bool, String> {
         return Ok(false);
     }
 
-    let started = show(display::screens().unwrap_or_default(), false, worker)?;
+    let started = show(display::screens().unwrap_or_default(), None, worker)?;
     if !started {
         fix::if_duplicate()?;
     }
     Ok(true)
 }
 
-/// Plays the card with made-up screens and changes nothing. `kind` is "dual" (the swap prompt),
-/// "single" (one ultrawide) or "error".
+/// Plays the card with made-up screens and changes nothing. `kind` is "dual" (two monitors),
+/// "single" (one ultrawide), "done" (nothing to ask) or "error".
 pub fn preview(kind: &str) -> Result<(), String> {
     let kind = kind.to_owned();
     let start = match kind.as_str() {
-        "single" => vec![fake("Laptop + DELL U4021QW", false, true, 0, 0, 3840, 2400)],
+        "single" | "done" => vec![fake("Laptop + DELL U4021QW", false, true, 0, 0, 3840, 2400)],
         _ => vec![fake("Laptop + DELL U2723QE + LG 27UL850", false, true, 0, 0, 3840, 2400)],
     };
-    show(start, true, move |state, ctx| {
+    show(start, Some(kind.clone()), move |state, ctx| {
         let step = |phase: Phase, screens: Vec<Screen>, ms: u64| {
             set_phase_with(&state, &ctx, phase, Some(screens));
             sleep(Duration::from_millis(ms));
         };
         sleep(Duration::from_millis(1400));
-        let arranged = if kind == "single" {
-            vec![
-                fake("Laptop", true, false, -3840, 1080, 3840, 2400),
-                fake("DELL U4021QW", false, true, 0, 0, 5120, 2160),
-            ]
-        } else {
-            preview_dual(false)
-        };
+        let arranged = preview_screens(&kind, false);
         step(Phase::Working("Arranging your screens".into()), arranged.clone(), 1000);
         step(Phase::Working(format!("Setting external displays to {}%", fix::EXTERNAL_SCALE)), arranged.clone(), 800);
         let last = match kind.as_str() {
-            "dual" => Phase::Prompt,
             "error" => Phase::Failed("SetDisplayConfig (arrange) failed with error 87".into()),
-            _ => Phase::Done("DELL U4021QW is your main display.".into()),
+            "done" => Phase::Done("DELL U4021QW is your main display.".into()),
+            _ => Phase::Prompt,
         };
         set_phase_with(&state, &ctx, last, Some(arranged));
     })
@@ -136,7 +129,14 @@ fn fake(name: &str, internal: bool, primary: bool, x: i32, y: i32, width: i32, h
     Screen { name: name.into(), internal, primary, x, y, width, height }
 }
 
-fn preview_dual(swapped: bool) -> Vec<Screen> {
+fn preview_screens(kind: &str, swapped: bool) -> Vec<Screen> {
+    if matches!(kind, "single" | "done") {
+        let laptop_x = if swapped { 5120 } else { -3840 };
+        return vec![
+            fake("Laptop", true, false, laptop_x, 1080, 3840, 2400),
+            fake("DELL U4021QW", false, true, 0, 0, 5120, 2160),
+        ];
+    }
     let (left, right) = if swapped { ("LG 27UL850", "DELL U2723QE") } else { ("DELL U2723QE", "LG 27UL850") };
     vec![
         fake(left, false, true, 0, 0, 2560, 1440),
@@ -148,7 +148,7 @@ fn preview_dual(swapped: bool) -> Vec<Screen> {
 /// Shows the card and runs `work` alongside it. Returns false if the window never started.
 fn show(
     screens: Vec<Screen>,
-    preview: bool,
+    preview: Option<String>,
     work: impl FnOnce(State, egui::Context) + Send + 'static,
 ) -> Result<bool, String> {
     let state: State = Arc::new(Mutex::new(Shared {
@@ -201,7 +201,7 @@ fn worker(state: State, ctx: egui::Context) {
         set_phase(&state, &ctx, Phase::Working(format!("Setting external displays to {}%", fix::EXTERNAL_SCALE)));
         sleep(Duration::from_millis(400));
         fix::scale()?;
-        Ok(arrangement.dual)
+        Ok(arrangement.swappable)
     })();
     let phase = match result {
         Ok(true) => Phase::Prompt,
@@ -260,12 +260,13 @@ struct Card {
     shown: Option<Instant>,
     closing: Option<Instant>,
     alpha: Option<u8>,
-    preview: bool,
+    /// The preview kind when playing with made-up screens.
+    preview: Option<String>,
     swapped: bool,
 }
 
 impl Card {
-    fn new(state: State, preview: bool) -> Self {
+    fn new(state: State, preview: Option<String>) -> Self {
         Card { state, hwnd: None, shown: None, closing: None, alpha: None, preview, swapped: false }
     }
 
@@ -276,24 +277,25 @@ impl Card {
     fn act(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Keep => {
-                if !self.preview {
-                    log::line("Kept the monitor order.");
+                if self.preview.is_none() {
+                    log::line("Kept the layout.");
                 }
                 self.close();
             }
             Action::Close => self.close(),
-            Action::Swap if self.preview => {
+            Action::Swap if self.preview.is_some() => {
                 self.swapped = !self.swapped;
                 let current = self.state.lock().unwrap().screens.clone();
-                set_phase_with(&self.state, ctx, Phase::Working("Swapping your monitors".into()), Some(current));
+                set_phase_with(&self.state, ctx, Phase::Working("Swapping sides".into()), Some(current));
                 let (state, ctx, swapped) = (self.state.clone(), ctx.clone(), self.swapped);
+                let kind = self.preview.clone().unwrap_or_default();
                 spawn(move || {
                     sleep(Duration::from_millis(700));
-                    set_phase_with(&state, &ctx, Phase::Prompt, Some(preview_dual(swapped)));
+                    set_phase_with(&state, &ctx, Phase::Prompt, Some(preview_screens(&kind, swapped)));
                 });
             }
             Action::Swap => {
-                set_phase(&self.state, ctx, Phase::Working("Swapping your monitors".into()));
+                set_phase(&self.state, ctx, Phase::Working("Swapping sides".into()));
                 let (state, ctx) = (self.state.clone(), ctx.clone());
                 spawn(move || {
                     let phase = match fix::arrange(true) {
@@ -453,7 +455,7 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen]) ->
     let text_w = rect.right() - PAD - text_x;
     let (title, subtitle) = match phase {
         Phase::Working(step) => ("Setting up your displays".to_string(), format!("{step}{}", dots(t))),
-        Phase::Prompt => ("Are your monitors the right way round?".to_string(), prompt_subtitle(screens)),
+        Phase::Prompt => prompt_text(screens),
         Phase::Done(summary) => ("Displays ready".to_string(), summary.clone()),
         Phase::Failed(e) => ("Couldn't set up your displays".to_string(), e.clone()),
     };
@@ -534,13 +536,28 @@ fn dots(t: f32) -> &'static str {
     ["", ".", "..", "..."][((t * 2.5) as usize) % 4]
 }
 
-fn prompt_subtitle(screens: &[Screen]) -> String {
+/// Title and subtitle for the swap prompt: about the two monitors, or about the laptop's side.
+fn prompt_text(screens: &[Screen]) -> (String, String) {
     let mut externals: Vec<_> = screens.iter().filter(|s| !s.internal).collect();
     externals.sort_by_key(|s| s.x);
-    match externals.as_slice() {
-        [left, right] if left.name != right.name => format!("{} should be on your left, {} on your right.", left.name, right.name),
-        _ => "The main display should be the one on your left.".into(),
+    if let [left, right] = externals.as_slice() {
+        let sub = if left.name != right.name {
+            format!("{} should be on your left, {} on your right.", left.name, right.name)
+        } else {
+            "The main display should be the one on your left.".into()
+        };
+        return ("Are your monitors the right way round?".into(), sub);
     }
+    let main = externals.iter().find(|s| s.primary).or(externals.first());
+    let laptop = screens.iter().find(|s| s.internal);
+    let sub = match (main, laptop) {
+        (Some(m), Some(l)) => {
+            let side = if l.x >= m.x + m.width { "right" } else { "left" };
+            format!("Your laptop should be to the {side} of {}.", m.name)
+        }
+        _ => "Swap if the screens are the wrong way round.".into(),
+    };
+    ("Is your laptop on the correct side?".into(), sub)
 }
 
 fn draw_screens(ui: &egui::Ui, painter: &Painter, area: Rect, screens: &[Screen]) {

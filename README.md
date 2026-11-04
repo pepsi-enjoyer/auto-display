@@ -13,16 +13,22 @@ Win+P to present), it leaves that alone.
 ## On-screen card
 
 While it works, a small card on the main display shows what it is doing and a live diagram of the
-screens. When it used the two-monitor layout, the card asks whether the monitors are the right way
-round: **Swap sides** reverses them (and restarts the countdown, so you can swap back), **Keep** or
-waiting 10 seconds keeps them. Enter or Esc keeps, S swaps. Otherwise it shows "Displays ready" for a
-few seconds and fades out.
+screens. Windows cannot know where screens physically sit, so the card then asks whether the layout
+is the right way round:
+
+- two monitors: are they in the right order?
+- one monitor and the laptop: is the laptop on the correct side? (left by default)
+
+**Swap sides** swaps them (and restarts the countdown, so you can swap back); **Keep**, or waiting 10
+seconds, keeps them. Enter or Esc keeps, S swaps. With nothing to swap (for example the lid closed and
+one monitor), it shows "Displays ready" for a few seconds and fades out. `auto-display swap` swaps
+sides at any time.
 
 The card runs as a separate short-lived process (`auto-display setup`). If it cannot start, the
 watcher fixes the displays without it. Try it without touching your displays:
 
 ```powershell
-auto-display preview dual     # also: single, error
+auto-display preview dual     # also: single, done, error
 ```
 
 ## Layout
@@ -34,7 +40,7 @@ Positions are in physical pixels.
   sits below both, centred on the line between them.
 - **Anything else** (for example one ultrawide): the first external monitor is the main display at
   (0, 0), any other external monitors follow it to the right with tops aligned, and the laptop screen
-  sits to its left with the laptop's top edge halfway down the main monitor.
+  sits to its left (or right, after a swap) with the laptop's top edge halfway down the main monitor.
 
 ## Install
 
@@ -55,8 +61,9 @@ cargo build --release
 | `uninstall` | Stop it and remove the sign-in entry |
 | `status` | Show connected displays, positions, scaling and whether the watcher is running |
 | `apply` | Fix the displays now if they are duplicated, with the on-screen card |
-| `preview [dual\|single\|error]` | Play the card with made-up screens; changes nothing |
+| `preview [dual\|single\|done\|error]` | Play the card with made-up screens; changes nothing |
 | `layout` | Apply the layout and scaling now, even if not duplicated |
+| `swap` | Swap sides: the two monitors, or the laptop to the other side of the monitor |
 | `watch` | Run the watcher (what the sign-in entry runs) |
 
 It is built as a windowed program so nothing flashes at sign-in, so output from these commands can

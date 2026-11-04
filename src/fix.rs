@@ -30,7 +30,7 @@ pub fn arrange(swap: bool) -> Result<display::Arrangement, String> {
     let arrangement = display::arrange(swap)?;
     if arrangement.changed {
         log::line(if swap {
-            "Swapped the two external monitors."
+            "Swapped sides."
         } else {
             "Made an external display primary and arranged the screens."
         });
