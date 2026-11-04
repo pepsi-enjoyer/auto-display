@@ -5,8 +5,8 @@ use crate::{display, log};
 
 pub const EXTERNAL_SCALE: u32 = 150;
 
-/// If the displays are duplicated: extend, make an external display primary, put the laptop screen
-/// to its left, and set external displays to 150%.
+/// Headless fix, used when the on-screen card cannot start: if the displays are duplicated, extend,
+/// arrange and scale them.
 pub fn if_duplicate() -> Result<bool, String> {
     if !display::is_duplicate(&display::active()?.paths) {
         return Ok(false);
@@ -18,10 +18,27 @@ pub fn if_duplicate() -> Result<bool, String> {
     Ok(true)
 }
 
-pub fn apply_layout() -> Result<(), String> {
-    if display::arrange()? {
-        log::line("Made the external display primary and moved the laptop screen to its left.");
+/// Arranges the screens and sets external scaling. Returns the arrangement so the caller knows
+/// whether the two-monitor layout was used.
+pub fn apply_layout() -> Result<display::Arrangement, String> {
+    let arrangement = arrange(false)?;
+    scale()?;
+    Ok(arrangement)
+}
+
+pub fn arrange(swap: bool) -> Result<display::Arrangement, String> {
+    let arrangement = display::arrange(swap)?;
+    if arrangement.changed {
+        log::line(if swap {
+            "Swapped the two external monitors."
+        } else {
+            "Made an external display primary and arranged the screens."
+        });
     }
+    Ok(arrangement)
+}
+
+pub fn scale() -> Result<(), String> {
     let n = display::scale_externals(EXTERNAL_SCALE)?;
     if n > 0 {
         log::line(&format!("Set {n} external display(s) to {EXTERNAL_SCALE}%."));

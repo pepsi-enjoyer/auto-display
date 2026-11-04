@@ -10,6 +10,21 @@ It checks at sign-in and whenever a monitor is plugged in or removed. It only ac
 the set of connected monitors changes, so if you choose duplicate yourself later (for example with
 Win+P to present), it leaves that alone.
 
+## On-screen card
+
+While it works, a small card on the main display shows what it is doing and a live diagram of the
+screens. When it used the two-monitor layout, the card asks whether the monitors are the right way
+round: **Swap sides** reverses them (and restarts the countdown, so you can swap back), **Keep** or
+waiting 10 seconds keeps them. Enter or Esc keeps, S swaps. Otherwise it shows "Displays ready" for a
+few seconds and fades out.
+
+The card runs as a separate short-lived process (`auto-display setup`). If it cannot start, the
+watcher fixes the displays without it. Try it without touching your displays:
+
+```powershell
+auto-display preview dual     # also: single, error
+```
+
 ## Layout
 
 Positions are in physical pixels.
@@ -39,7 +54,8 @@ cargo build --release
 | `install` | Install, run at every sign-in, and start now |
 | `uninstall` | Stop it and remove the sign-in entry |
 | `status` | Show connected displays, positions, scaling and whether the watcher is running |
-| `apply` | Fix the displays now if they are duplicated |
+| `apply` | Fix the displays now if they are duplicated, with the on-screen card |
+| `preview [dual\|single\|error]` | Play the card with made-up screens; changes nothing |
 | `layout` | Apply the layout and scaling now, even if not duplicated |
 | `watch` | Run the watcher (what the sign-in entry runs) |
 

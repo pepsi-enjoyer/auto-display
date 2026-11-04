@@ -14,7 +14,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
-use crate::{display, fix, log};
+use crate::{display, fix, install, log};
 
 const CLASS_NAME: &str = "auto-display-watcher";
 const MUTEX_NAME: &str = "Local\\auto-display";
@@ -147,6 +147,22 @@ fn check(hwnd: HWND) {
         true
     });
     if act {
+        match display::active() {
+            Ok(cfg) if display::is_duplicate(&cfg.paths) => start_setup(),
+            Ok(_) => {}
+            Err(e) => log::line(&format!("error: {e}")),
+        }
+    }
+}
+
+/// The fix runs in its own process so it can show the on-screen card. If it cannot be started, fix
+/// the displays here without the card.
+fn start_setup() {
+    let started = std::env::current_exe()
+        .map_err(|e| e.to_string())
+        .and_then(|exe| install::start_detached(&format!("\"{}\" setup", exe.display())));
+    if let Err(e) = started {
+        log::line(&format!("Could not start the setup card ({e}); fixing without it."));
         if let Err(e) = fix::if_duplicate() {
             log::line(&format!("error: {e}"));
         }

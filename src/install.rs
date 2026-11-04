@@ -65,7 +65,7 @@ pub fn install() -> Result<(), String> {
 
 /// Starts the watcher without handing it any of our handles. std::process::Command lets the child
 /// inherit the caller's console pipes, which makes a shell wait for the watcher to exit.
-fn start_detached(command_line: &str) -> Result<(), String> {
+pub fn start_detached(command_line: &str) -> Result<(), String> {
     let mut cmd = watch::wide(command_line);
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
