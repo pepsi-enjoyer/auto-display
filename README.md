@@ -13,7 +13,8 @@ example to present, it leaves you alone.
 
 - **One monitor:** the laptop sits to its left, with the laptop's top edge level with the middle of
   the monitor.
-- **Two monitors:** side by side, with the laptop below, centred between them.
+- **Two monitors:** side by side, with the right one as the main display and the laptop below,
+  centred between them.
 
 Windows can't tell where your screens physically are, so a small card pops up asking whether the
 layout is the right way round. Click **Swap sides** to fix it, or **Keep**. It keeps the layout on

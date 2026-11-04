@@ -277,7 +277,7 @@ pub struct Plan {
 /// Where each source should sit.
 ///
 /// - Two external monitors, neither ultrawide: side by side with tops aligned, keeping their current
-///   left-to-right order (or reversing it when `swap` is set). The left one is primary. The laptop
+///   left-to-right order (or reversing it when `swap` is set). The right one is primary. The laptop
 ///   screen sits below both, centred on the line between them.
 /// - Otherwise: the first external display is primary at (0, 0), other externals follow it to the
 ///   right with tops aligned, and the laptop screen sits to the left of them with its top edge halfway
@@ -303,11 +303,11 @@ pub fn plan_layout(paths: &[PathInfo], modes: &[ModeInfo], swap: bool) -> Plan {
         if swap {
             pair.reverse();
         }
+        // The primary display must sit at (0, 0), so the seam between the two is at x = 0.
         let (left, right) = (modes[pair[0]].source_mode(), modes[pair[1]].source_mode());
-        let seam = left.width as i32;
         let bottom = left.height.max(right.height) as i32;
-        let mut moves = vec![(pair[0], 0, 0), (pair[1], seam, 0)];
-        let mut x = seam - internals.iter().map(|&i| modes[i].source_mode().width as i32).sum::<i32>() / 2;
+        let mut moves = vec![(pair[0], -(left.width as i32), 0), (pair[1], 0, 0)];
+        let mut x = -internals.iter().map(|&i| modes[i].source_mode().width as i32).sum::<i32>() / 2;
         for &idx in &internals {
             moves.push((idx, x, bottom));
             x += modes[idx].source_mode().width as i32;
@@ -378,6 +378,8 @@ pub fn arrange(swap: bool) -> Result<Arrangement> {
 /// One desktop area as the user sees it. Duplicated monitors share one entry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Screen {
+    /// Stable while the screen exists (Windows' \\.\DISPLAYn name); names can repeat.
+    pub id: String,
     pub name: String,
     pub internal: bool,
     pub primary: bool,
@@ -403,6 +405,7 @@ pub fn screens() -> Result<Vec<Screen>> {
         out.push((
             idx,
             Screen {
+                id: gdi_name(p),
                 name,
                 internal: p.is_internal(),
                 primary: sm.x == 0 && sm.y == 0,
@@ -559,7 +562,8 @@ mod tests {
         let modes = [mode(3840, 2400, 0, 0), mode(2560, 1440, 4000, 0), mode(1920, 1080, -1920, 0)];
         let mut plan = plan_layout(&paths, &modes, false).moves;
         plan.sort();
-        assert_eq!(plan, vec![(0, 1920 - 1920, 1440), (1, 1920, 0), (2, 0, 0)]);
+        // The right (1440p) monitor is primary at (0, 0); the laptop is centred under the seam at 0.
+        assert_eq!(plan, vec![(0, -1920, 1440), (1, 0, 0), (2, -1920, 0)]);
         assert!(plan_layout(&paths, &modes, false).swappable);
     }
 
@@ -569,7 +573,7 @@ mod tests {
         let modes = [mode(3840, 2400, 0, 0), mode(2560, 1440, 4000, 0), mode(1920, 1080, -1920, 0)];
         let mut plan = plan_layout(&paths, &modes, true).moves;
         plan.sort();
-        assert_eq!(plan, vec![(0, 2560 - 1920, 1440), (1, 0, 0), (2, 2560, 0)]);
+        assert_eq!(plan, vec![(0, -1920, 1440), (1, -2560, 0), (2, 0, 0)]);
     }
 
     #[test]
@@ -615,7 +619,7 @@ mod tests {
         let modes = [ModeInfo::default(), mode(2560, 1440, 0, 0), mode(2560, 1440, 2560, 0)];
         let mut plan = plan_layout(&paths, &modes, false).moves;
         plan.sort();
-        assert_eq!(plan, vec![(1, 0, 0), (2, 2560, 0)]);
+        assert_eq!(plan, vec![(1, -2560, 0), (2, 0, 0)]);
     }
 
     #[test]

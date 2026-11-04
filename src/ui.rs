@@ -4,8 +4,9 @@
 //! message loop. A worker thread does the display changes and publishes progress; the card shows it,
 //! and for the two-monitor layout asks whether to swap the monitors, keeping after 10 seconds.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::ptr::null;
+use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{sleep, spawn};
@@ -13,13 +14,14 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Id, Key, Mesh,
-    Painter, Rect, Sense, Shape, Stroke, StrokeKind, Vec2, ViewportBuilder, ViewportCommand, pos2, vec2,
+    Painter, Rect, Sense, Shape, Stroke, StrokeKind, Vec2, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2,
 };
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint};
+use windows_sys::core::BOOL;
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, RECT};
+use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOSIZE,
+    FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW, MONITORINFOF_PRIMARY, GetWindowRect, HWND_TOPMOST, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOSIZE,
     SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, WS_EX_LAYERED,
 };
 
@@ -126,7 +128,7 @@ pub fn preview(kind: &str) -> Result<(), String> {
 }
 
 fn fake(name: &str, internal: bool, primary: bool, x: i32, y: i32, width: i32, height: i32) -> Screen {
-    Screen { name: name.into(), internal, primary, x, y, width, height }
+    Screen { id: name.into(), name: name.into(), internal, primary, x, y, width, height }
 }
 
 fn preview_screens(kind: &str, swapped: bool) -> Vec<Screen> {
@@ -139,9 +141,9 @@ fn preview_screens(kind: &str, swapped: bool) -> Vec<Screen> {
     }
     let (left, right) = if swapped { ("LG 27UL850", "DELL U2723QE") } else { ("DELL U2723QE", "LG 27UL850") };
     vec![
-        fake(left, false, true, 0, 0, 2560, 1440),
-        fake(right, false, false, 2560, 0, 2560, 1440),
-        fake("Laptop", true, false, 2560 - 1920, 1440, 3840, 2400),
+        fake(left, false, false, -2560, 0, 2560, 1440),
+        fake(right, false, true, 0, 0, 2560, 1440),
+        fake("Laptop", true, false, -1920, 1440, 3840, 2400),
     ]
 }
 
@@ -254,12 +256,24 @@ enum Action {
     Close,
 }
 
+/// One native window showing the card. The main one is eframe's root window; every other monitor
+/// gets an extra egui viewport.
+#[derive(Default)]
+struct CardWindow {
+    hwnd: Option<isize>,
+    alpha: Option<u8>,
+    shown: bool,
+}
+
 struct Card {
     state: State,
-    hwnd: Option<isize>,
     shown: Option<Instant>,
     closing: Option<Instant>,
-    alpha: Option<u8>,
+    /// Work areas of the desktop monitors, main display first.
+    monitors: Vec<RECT>,
+    /// Opacity for this frame, shared by every window.
+    alpha: u8,
+    windows: HashMap<ViewportId, CardWindow>,
     /// The preview kind when playing with made-up screens.
     preview: Option<String>,
     swapped: bool,
@@ -267,7 +281,43 @@ struct Card {
 
 impl Card {
     fn new(state: State, preview: Option<String>) -> Self {
-        Card { state, hwnd: None, shown: None, closing: None, alpha: None, preview, swapped: false }
+        Card {
+            state,
+            shown: None,
+            closing: None,
+            monitors: Vec::new(),
+            alpha: 0,
+            windows: HashMap::new(),
+            preview,
+            swapped: false,
+        }
+    }
+
+    /// Styles, fades and centres one card window on its monitor, and shows it once it is ready.
+    fn manage(&mut self, ctx: &egui::Context, id: ViewportId, hwnd: Option<isize>, monitor: usize) {
+        let alpha = self.alpha;
+        let work = self.monitors.get(monitor).copied();
+        let win = self.windows.entry(id).or_default();
+        if win.hwnd.is_none() {
+            win.hwnd = hwnd;
+            if let Some(h) = hwnd {
+                style_window(h);
+                set_alpha(h, 0);
+                win.alpha = Some(0);
+            }
+        }
+        let Some(h) = win.hwnd else { return };
+        if let Some(work) = work {
+            centre_in(h, work);
+        }
+        if !win.shown {
+            ctx.send_viewport_cmd_to(id, ViewportCommand::Visible(true));
+            win.shown = true;
+        }
+        if win.alpha != Some(alpha) {
+            set_alpha(h, alpha);
+            win.alpha = Some(alpha);
+        }
     }
 
     fn close(&mut self) {
@@ -320,32 +370,18 @@ impl eframe::App for Card {
     /// Window management lives here because `ui` does not run while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let now = Instant::now();
-        if self.hwnd.is_none() {
-            self.hwnd = hwnd(frame);
-            if let Some(h) = self.hwnd {
-                style_window(h);
-                set_alpha(h, 0);
-                self.alpha = Some(0);
-            }
-        }
-        let Some(h) = self.hwnd else {
-            ctx.request_repaint();
-            return;
-        };
-        // The screens move under us while we work, so keep re-centring on the main display.
-        centre_on_primary(h);
-        if self.shown.is_none() {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-            self.shown = Some(now);
-        }
-
+        // The screens move under us while we work, so look them up every frame.
+        self.monitors = monitors();
         let fade_in = self.shown.map_or(0.0, |t| (now - t).as_secs_f32() / FADE_IN).clamp(0.0, 1.0);
         let fade_out = self.closing.map_or(1.0, |t| 1.0 - (now - t).as_secs_f32() / FADE_OUT).clamp(0.0, 1.0);
-        let alpha = (ease_out(fade_in) * fade_out * 255.0).round() as u8;
-        if self.alpha != Some(alpha) {
-            set_alpha(h, alpha);
-            self.alpha = Some(alpha);
+        self.alpha = (ease_out(fade_in) * fade_out * 255.0).round() as u8;
+
+        self.manage(ctx, ViewportId::ROOT, hwnd(frame), 0);
+        if self.windows.get(&ViewportId::ROOT).is_none_or(|w| w.hwnd.is_none()) {
+            ctx.request_repaint();
+            return;
         }
+        self.shown.get_or_insert(now);
         if self.closing.is_some_and(|t| now - t > Duration::from_secs_f32(FADE_OUT + 0.02)) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
@@ -370,8 +406,28 @@ impl eframe::App for Card {
             let s = self.state.lock().unwrap();
             (s.phase.clone(), s.since, s.screens.clone())
         };
-        if let Some(action) = draw(ui, &phase, since, &screens) {
-            let ctx = ui.ctx().clone();
+        let ctx = ui.ctx().clone();
+        let mut action = draw(ui, &phase, since, &screens);
+
+        // The same card on every other monitor; any of them can be clicked.
+        for monitor in 1..self.monitors.len() {
+            let id = ViewportId::from_hash_of(("card", monitor));
+            let title = format!("auto-display ({})", monitor + 1);
+            let builder = ViewportBuilder::default()
+                .with_title(title.clone())
+                .with_inner_size([WIDTH, HEIGHT])
+                .with_decorations(false)
+                .with_always_on_top()
+                .with_taskbar(false)
+                .with_resizable(false)
+                .with_active(false)
+                .with_visible(false);
+            let clicked = ctx.show_viewport_immediate(id, builder, |ui, _| draw(ui, &phase, since, &screens));
+            action = action.or(clicked);
+            self.manage(&ctx, id, find_window(&title), monitor);
+        }
+
+        if let Some(action) = action {
             self.act(action, &ctx);
         }
     }
@@ -544,7 +600,7 @@ fn prompt_text(screens: &[Screen]) -> (String, String) {
         let sub = if left.name != right.name {
             format!("{} should be on your left, {} on your right.", left.name, right.name)
         } else {
-            "The main display should be the one on your left.".into()
+            "The main display should be the one on your right.".into()
         };
         return ("Are your monitors the right way round?".into(), sub);
     }
@@ -578,7 +634,7 @@ fn draw_screens(ui: &egui::Ui, painter: &Painter, area: Rect, screens: &[Screen]
             offset + vec2(s.x as f32 - min_x, s.y as f32 - min_y) * scale,
             vec2(s.width as f32, s.height as f32) * scale,
         );
-        let id = Id::new(("screen", &s.name));
+        let id = Id::new(("screen", &s.id));
         let anim = |k: &str, v: f32| ctx.animate_value_with_time(id.with(k), v, 0.35);
         let r = Rect::from_min_size(
             pos2(anim("x", target.left()), anim("y", target.top())),
@@ -718,20 +774,36 @@ fn set_alpha(h: isize, alpha: u8) {
     }
 }
 
-fn centre_on_primary(h: isize) {
+/// Work areas of the monitors on the desktop, the main display first, then left to right.
+fn monitors() -> Vec<RECT> {
+    unsafe extern "system" fn collect(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
+        let list = unsafe { &mut *(data as *mut Vec<(bool, RECT)>) };
+        let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+            list.push((info.dwFlags & MONITORINFOF_PRIMARY != 0, info.rcWork));
+        }
+        1
+    }
+    let mut list: Vec<(bool, RECT)> = Vec::new();
+    unsafe { EnumDisplayMonitors(null_mut(), null(), Some(collect), &mut list as *mut _ as LPARAM) };
+    list.sort_by_key(|&(primary, r)| (!primary, r.left, r.top));
+    list.into_iter().map(|(_, r)| r).collect()
+}
+
+fn find_window(title: &str) -> Option<isize> {
+    let title = watch::wide(title);
+    let h = unsafe { FindWindowW(null(), title.as_ptr()) };
+    (!h.is_null()).then_some(h as isize)
+}
+
+fn centre_in(h: isize, work: RECT) {
     let hwnd = h as HWND;
     unsafe {
-        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-        let mut info: MONITORINFO = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(monitor, &mut info) == 0 {
-            return;
-        }
         let mut wr: RECT = std::mem::zeroed();
         if GetWindowRect(hwnd, &mut wr) == 0 {
             return;
         }
-        let work = info.rcWork;
         let size = Vec2::new((wr.right - wr.left) as f32, (wr.bottom - wr.top) as f32);
         let x = work.left + ((work.right - work.left) as f32 - size.x) as i32 / 2;
         let y = work.top + ((work.bottom - work.top) as f32 - size.y) as i32 / 2;
