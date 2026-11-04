@@ -19,6 +19,10 @@ Windows can't tell where your screens physically are, so a small card pops up as
 layout is the right way round. Click **Swap sides** to fix it, or **Keep**. It keeps the layout on
 its own after 10 seconds.
 
+<img src="docs/card.png" alt="The card asking whether the laptop is on the correct side, with Swap sides and Keep buttons" width="540">
+
+
+
 ## Install
 
 ```powershell
