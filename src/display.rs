@@ -261,28 +261,83 @@ pub fn extend() -> Result<()> {
 /// Width-to-height ratio at or above which a monitor counts as ultrawide (21:9 is about 2.33).
 const ULTRAWIDE_RATIO: f64 = 2.0;
 
-fn is_ultrawide(m: &SourceMode) -> bool {
-    m.height > 0 && m.width as f64 / m.height as f64 >= ULTRAWIDE_RATIO
+pub fn is_ultrawide(width: i32, height: i32) -> bool {
+    height > 0 && width as f64 / height as f64 >= ULTRAWIDE_RATIO
+}
+
+/// Where the laptop screen sits relative to the external monitors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+    Below,
+}
+
+pub const SIDES: [Side; 3] = [Side::Left, Side::Right, Side::Below];
+
+/// A rectangle on the desktop, in physical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Area {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// Two external monitors, neither ultrawide: they sit side by side and the right one is primary.
+pub fn is_dual(externals: &[Area]) -> bool {
+    externals.len() == 2 && externals.iter().all(|a| !is_ultrawide(a.w, a.h))
+}
+
+/// Top-left corner for a laptop screen of `size` (w, h) on `side` of the external monitors, which
+/// are already arranged in a row.
+///
+/// - Left / Right: beside the outermost monitor, with the laptop's top edge halfway down it.
+/// - Below: under the row, centred on the seam between two monitors, or on the middle of the row.
+pub fn laptop_spot(externals: &[Area], size: (i32, i32), side: Side) -> (i32, i32) {
+    let Some(left) = externals.iter().min_by_key(|a| a.x) else { return (0, 0) };
+    let right = externals.iter().max_by_key(|a| a.x + a.w).unwrap();
+    match side {
+        Side::Left => (left.x - size.0, left.y + left.h / 2),
+        Side::Right => (right.x + right.w, right.y + right.h / 2),
+        Side::Below => {
+            let bottom = externals.iter().map(|a| a.y + a.h).max().unwrap();
+            let centre = if externals.len() == 2 { left.x + left.w } else { (left.x + right.x + right.w) / 2 };
+            (centre - size.0 / 2, bottom)
+        }
+    }
+}
+
+/// Which side the laptop is on, if it is exactly where `laptop_spot` would put it.
+pub fn laptop_side(externals: &[Area], laptop: Area) -> Option<Side> {
+    SIDES.into_iter().find(|&s| laptop_spot(externals, (laptop.w, laptop.h), s) == (laptop.x, laptop.y))
+}
+
+fn area(m: &ModeInfo) -> Area {
+    let sm = m.source_mode();
+    Area { x: sm.x, y: sm.y, w: sm.width as i32, h: sm.height as i32 }
 }
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
     /// (mode index, x, y) in physical pixels.
     pub moves: Vec<(usize, i32, i32)>,
-    /// True when the layout has two sides that could be the wrong way round, so the user should be
-    /// asked whether to swap.
-    pub swappable: bool,
+    /// The two-monitor layout, whose order may need swapping.
+    pub dual: bool,
+    /// Where the laptop screen ends up, if it is on.
+    pub laptop: Option<Side>,
 }
 
 /// Where each source should sit.
 ///
 /// - Two external monitors, neither ultrawide: side by side with tops aligned, keeping their current
-///   left-to-right order (or reversing it when `swap` is set). The right one is primary. The laptop
-///   screen sits below both, centred on the line between them.
-/// - Otherwise: the first external display is primary at (0, 0), other externals follow it to the
-///   right with tops aligned, and the laptop screen sits to the left of them with its top edge halfway
-///   down the primary. With `swap`, the laptop moves to the other side from where it is now.
-pub fn plan_layout(paths: &[PathInfo], modes: &[ModeInfo], swap: bool) -> Plan {
+///   left-to-right order (reversed with `swap_monitors`). The right one is primary.
+/// - Otherwise: the first external display is primary at (0, 0) and any others follow it to the right
+///   with tops aligned.
+///
+/// The laptop goes on `laptop` if given, else stays on the side it is on now, else goes below two
+/// monitors or to the left of one.
+pub fn plan_layout(paths: &[PathInfo], modes: &[ModeInfo], laptop: Option<Side>, swap_monitors: bool) -> Plan {
     let mut seen = Vec::new();
     let mut externals = Vec::new();
     let mut internals = Vec::new();
@@ -294,68 +349,70 @@ pub fn plan_layout(paths: &[PathInfo], modes: &[ModeInfo], swap: bool) -> Plan {
         seen.push(idx);
         if p.is_internal() { internals.push(idx) } else { externals.push(idx) }
     }
-    let Some(&primary) = externals.first() else { return Plan::default() };
-    let primary_mode = modes[primary].source_mode();
+    if externals.is_empty() {
+        return Plan::default();
+    }
 
-    if externals.len() == 2 && externals.iter().all(|&i| !is_ultrawide(&modes[i].source_mode())) {
+    let before: Vec<Area> = externals.iter().map(|&i| area(&modes[i])).collect();
+    let current_side = internals.first().and_then(|&i| laptop_side(&before, area(&modes[i])));
+    let dual = is_dual(&before);
+
+    let mut moves = Vec::new();
+    if dual {
         let mut pair = externals.clone();
         pair.sort_by_key(|&i| modes[i].source_mode().x);
-        if swap {
+        if swap_monitors {
             pair.reverse();
         }
         // The primary display must sit at (0, 0), so the seam between the two is at x = 0.
-        let (left, right) = (modes[pair[0]].source_mode(), modes[pair[1]].source_mode());
-        let bottom = left.height.max(right.height) as i32;
-        let mut moves = vec![(pair[0], -(left.width as i32), 0), (pair[1], 0, 0)];
-        let mut x = -internals.iter().map(|&i| modes[i].source_mode().width as i32).sum::<i32>() / 2;
-        for &idx in &internals {
-            moves.push((idx, x, bottom));
-            x += modes[idx].source_mode().width as i32;
+        moves.push((pair[0], -area(&modes[pair[0]]).w, 0));
+        moves.push((pair[1], 0, 0));
+    } else {
+        let mut x = 0;
+        for &idx in &externals {
+            moves.push((idx, x, 0));
+            x += area(&modes[idx]).w;
         }
-        return Plan { moves, swappable: true };
     }
+    let after: Vec<Area> = moves.iter().map(|&(i, x, y)| Area { x, y, ..area(&modes[i]) }).collect();
 
-    let mut moves = Vec::new();
-    let mut x = 0i32;
-    for &idx in &externals {
-        moves.push((idx, x, 0));
-        x += modes[idx].source_mode().width as i32;
-    }
-    // Left by default; a swap puts the laptop on the opposite side to where it is now.
-    let laptop_now_right = internals.first().is_some_and(|&i| modes[i].source_mode().x > primary_mode.x);
-    let on_right = swap && !laptop_now_right;
-    let top = primary_mode.height as i32 / 2;
-    let mut left = 0i32;
+    let side = laptop.or(current_side).unwrap_or(if dual { Side::Below } else { Side::Left });
+    let mut next: Option<(i32, i32)> = None;
     for &idx in &internals {
-        let width = modes[idx].source_mode().width as i32;
-        if on_right {
-            moves.push((idx, x, top));
-            x += width;
-        } else {
-            left -= width;
-            moves.push((idx, left, top));
-        }
+        let a = area(&modes[idx]);
+        // A second internal panel (rare) sits to the right of the first.
+        let (x, y) = next.unwrap_or_else(|| laptop_spot(&after, (a.w, a.h), side));
+        moves.push((idx, x, y));
+        next = Some((x + a.w, y));
     }
-    Plan { moves, swappable: !internals.is_empty() }
+    Plan { moves, dual, laptop: (!internals.is_empty()).then_some(side) }
 }
 
 #[derive(Debug, Default)]
 pub struct Arrangement {
     pub changed: bool,
-    pub swappable: bool,
+    pub dual: bool,
+    pub laptop: Option<Side>,
+}
+
+impl Arrangement {
+    /// Whether there is anything for the user to choose: the monitor order or the laptop's side.
+    pub fn has_choices(&self) -> bool {
+        self.dual || self.laptop.is_some()
+    }
 }
 
 /// Makes an external display primary and arranges the rest around it (see `plan_layout`).
-pub fn arrange(swap: bool) -> Result<Arrangement> {
+pub fn arrange(laptop: Option<Side>, swap_monitors: bool) -> Result<Arrangement> {
     let mut cfg = active()?;
-    let plan = plan_layout(&cfg.paths, &cfg.modes, swap);
-    let swappable = plan.swappable;
+    let plan = plan_layout(&cfg.paths, &cfg.modes, laptop, swap_monitors);
+    let (dual, laptop) = (plan.dual, plan.laptop);
     let unchanged = plan.moves.iter().all(|&(i, x, y)| {
         let sm = cfg.modes[i].source_mode();
         sm.x == x && sm.y == y
     });
     if unchanged {
-        return Ok(Arrangement { changed: false, swappable });
+        return Ok(Arrangement { changed: false, dual, laptop });
     }
     for (i, x, y) in plan.moves {
         cfg.modes[i].set_position(x, y);
@@ -372,7 +429,7 @@ pub fn arrange(swap: bool) -> Result<Arrangement> {
         },
         "SetDisplayConfig (arrange)",
     )?;
-    Ok(Arrangement { changed: true, swappable })
+    Ok(Arrangement { changed: true, dual, laptop })
 }
 
 /// One desktop area as the user sees it. Duplicated monitors share one entry.
@@ -387,6 +444,14 @@ pub struct Screen {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// Physical size of the visible picture in millimetres (width, height), from the monitor's EDID.
+    pub mm: Option<(f32, f32)>,
+}
+
+impl Screen {
+    pub fn area(&self) -> Area {
+        Area { x: self.x, y: self.y, w: self.width, h: self.height }
+    }
 }
 
 pub fn screens() -> Result<Vec<Screen>> {
@@ -413,10 +478,53 @@ pub fn screens() -> Result<Vec<Screen>> {
                 y: sm.y,
                 width: sm.width as i32,
                 height: sm.height as i32,
+                mm: target_name(p).and_then(|t| physical_size(&from_wide(&t.device_path))),
             },
         ));
     }
     Ok(out.into_iter().map(|(_, s)| s).collect())
+}
+
+/// The picture size in millimetres from the monitor's EDID, which Windows keeps in the registry
+/// under the monitor's device instance. Uses the first detailed timing (millimetre precision),
+/// falling back to the basic size (centimetres).
+fn physical_size(device_path: &str) -> Option<(f32, f32)> {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_BINARY, RegGetValueW};
+    // \\?\DISPLAY#DEL4205#4&30cd1115&0&UID45127#{e6f07b5f-...}
+    let mut parts = device_path.split('#');
+    let (_, model, instance) = (parts.next()?, parts.next()?, parts.next()?);
+    let key = format!(r"SYSTEM\CurrentControlSet\Enum\DISPLAY\{model}\{instance}\Device Parameters");
+    let (key, value) = (crate::watch::wide(&key), crate::watch::wide("EDID"));
+    // 128 bytes per block; monitors with extension blocks (HDMI, DisplayID) send 256 to 512 or more.
+    let mut edid = [0u8; 2048];
+    let mut len = edid.len() as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_BINARY,
+            null_mut(),
+            edid.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || len < 128 {
+        return None;
+    }
+    edid_size(&edid[..len as usize])
+}
+
+fn edid_size(edid: &[u8]) -> Option<(f32, f32)> {
+    let d = &edid[54..72];
+    let pixel_clock = u16::from_le_bytes([d[0], d[1]]);
+    let w = d[12] as u32 | ((d[14] as u32 >> 4) << 8);
+    let h = d[13] as u32 | ((d[14] as u32 & 0x0f) << 8);
+    if pixel_clock != 0 && w > 0 && h > 0 {
+        return Some((w as f32, h as f32));
+    }
+    let (w_cm, h_cm) = (edid[21], edid[22]);
+    (w_cm > 0 && h_cm > 0).then_some((w_cm as f32 * 10.0, h_cm as f32 * 10.0))
 }
 
 pub struct Scale {
@@ -455,12 +563,13 @@ pub fn scale(p: &PathInfo) -> Result<Scale> {
     Ok(Scale::from_packet(&d))
 }
 
-/// Sets every external display to `percent`. Returns how many were changed.
-pub fn scale_externals(percent: u32) -> Result<usize> {
+/// Sets every laptop screen (`internal`) or every external monitor to `percent`. Returns how many
+/// were changed.
+pub fn scale_screens(internal: bool, percent: u32) -> Result<usize> {
     let cfg = active()?;
     let mut changed = 0;
     let mut done = Vec::new();
-    for p in cfg.paths.iter().filter(|p| !p.is_internal()) {
+    for p in cfg.paths.iter().filter(|p| p.is_internal() == internal) {
         if done.contains(&p.source_key()) {
             continue;
         }
@@ -546,89 +655,120 @@ mod tests {
         assert!(!is_duplicate(&[path(0, 1, true)]));
     }
 
-    #[test]
-    fn laptop_left_with_top_at_half_height() {
-        let paths = [path(0, 1, true), path(1, 2, false)];
-        let modes = [mode(3840, 2400, 0, 0), mode(5120, 2160, 3840, 0)];
-        let mut plan = plan_layout(&paths, &modes, false).moves;
-        plan.sort();
-        assert_eq!(plan, vec![(0, -3840, 1080), (1, 0, 0)]);
+    fn sorted(mut moves: Vec<(usize, i32, i32)>) -> Vec<(usize, i32, i32)> {
+        moves.sort();
+        moves
     }
 
     #[test]
-    fn two_normal_externals_with_laptop_centred_below() {
+    fn ultrawide_defaults_to_laptop_left_with_top_at_half_height() {
+        let paths = [path(0, 1, true), path(1, 2, false)];
+        let modes = [mode(3840, 2400, 0, 0), mode(5120, 2160, 3840, 0)];
+        let plan = plan_layout(&paths, &modes, None, false);
+        assert_eq!(plan.laptop, Some(Side::Left));
+        assert!(!plan.dual);
+        assert_eq!(sorted(plan.moves), vec![(0, -3840, 1080), (1, 0, 0)]);
+    }
+
+    #[test]
+    fn ultrawide_laptop_right_or_below() {
+        let paths = [path(0, 1, true), path(1, 2, false)];
+        let modes = [mode(3840, 2400, -3840, 1080), mode(5120, 2160, 0, 0)];
+        let right = plan_layout(&paths, &modes, Some(Side::Right), false);
+        assert_eq!(sorted(right.moves), vec![(0, 5120, 1080), (1, 0, 0)]);
+        // Below: centred under the monitor.
+        let below = plan_layout(&paths, &modes, Some(Side::Below), false);
+        assert_eq!(sorted(below.moves), vec![(0, 2560 - 1920, 2160), (1, 0, 0)]);
+    }
+
+    #[test]
+    fn keeps_the_laptop_on_its_current_side() {
+        let paths = [path(0, 1, true), path(1, 2, false)];
+        let modes = [mode(3840, 2400, 5120, 1080), mode(5120, 2160, 0, 0)];
+        let plan = plan_layout(&paths, &modes, None, false);
+        assert_eq!(plan.laptop, Some(Side::Right));
+        assert_eq!(sorted(plan.moves), vec![(0, 5120, 1080), (1, 0, 0)]);
+    }
+
+    #[test]
+    fn dual_defaults_to_right_primary_and_laptop_below_the_seam() {
         // Windows currently has the 1440p monitor on the right; keep that order.
         let paths = [path(0, 1, true), path(1, 2, false), path(2, 3, false)];
         let modes = [mode(3840, 2400, 0, 0), mode(2560, 1440, 4000, 0), mode(1920, 1080, -1920, 0)];
-        let mut plan = plan_layout(&paths, &modes, false).moves;
-        plan.sort();
-        // The right (1440p) monitor is primary at (0, 0); the laptop is centred under the seam at 0.
-        assert_eq!(plan, vec![(0, -1920, 1440), (1, 0, 0), (2, -1920, 0)]);
-        assert!(plan_layout(&paths, &modes, false).swappable);
+        let plan = plan_layout(&paths, &modes, None, false);
+        assert!(plan.dual);
+        assert_eq!(plan.laptop, Some(Side::Below));
+        assert_eq!(sorted(plan.moves), vec![(0, -1920, 1440), (1, 0, 0), (2, -1920, 0)]);
     }
 
     #[test]
-    fn swap_reverses_the_pair_and_recentres_the_laptop() {
+    fn dual_laptop_left_or_right() {
         let paths = [path(0, 1, true), path(1, 2, false), path(2, 3, false)];
         let modes = [mode(3840, 2400, 0, 0), mode(2560, 1440, 4000, 0), mode(1920, 1080, -1920, 0)];
-        let mut plan = plan_layout(&paths, &modes, true).moves;
-        plan.sort();
-        assert_eq!(plan, vec![(0, -1920, 1440), (1, -2560, 0), (2, 0, 0)]);
+        // Left of the left (1080p) monitor, top halfway down it.
+        let left = plan_layout(&paths, &modes, Some(Side::Left), false);
+        assert_eq!(sorted(left.moves), vec![(0, -1920 - 3840, 540), (1, 0, 0), (2, -1920, 0)]);
+        // Right of the right (1440p) monitor, top halfway down it.
+        let right = plan_layout(&paths, &modes, Some(Side::Right), false);
+        assert_eq!(sorted(right.moves), vec![(0, 2560, 720), (1, 0, 0), (2, -1920, 0)]);
     }
 
     #[test]
-    fn swap_moves_the_laptop_to_the_other_side_of_the_ultrawide() {
-        let paths = [path(0, 1, true), path(1, 2, false)];
-        // Laptop on the left (the default): swapping puts it on the right.
-        let left = [mode(3840, 2400, -3840, 1080), mode(5120, 2160, 0, 0)];
-        let plan = plan_layout(&paths, &left, true);
-        assert!(plan.swappable);
-        let mut moves = plan.moves;
-        moves.sort();
-        assert_eq!(moves, vec![(0, 5120, 1080), (1, 0, 0)]);
-        // Laptop on the right: swapping puts it back on the left.
-        let right = [mode(3840, 2400, 5120, 1080), mode(5120, 2160, 0, 0)];
-        let mut moves = plan_layout(&paths, &right, true).moves;
-        moves.sort();
-        assert_eq!(moves, vec![(0, -3840, 1080), (1, 0, 0)]);
-        // Without a swap the laptop goes on the left whatever the starting point.
-        let mut moves = plan_layout(&paths, &right, false).moves;
-        moves.sort();
-        assert_eq!(moves, vec![(0, -3840, 1080), (1, 0, 0)]);
+    fn swapping_monitors_keeps_the_laptop_side() {
+        // Laptop already below the seam; swapping the pair keeps it below the new seam.
+        let paths = [path(0, 1, true), path(1, 2, false), path(2, 3, false)];
+        let modes = [mode(3840, 2400, -1920, 1440), mode(2560, 1440, 0, 0), mode(1920, 1080, -1920, 0)];
+        let plan = plan_layout(&paths, &modes, None, true);
+        assert_eq!(plan.laptop, Some(Side::Below));
+        assert_eq!(sorted(plan.moves), vec![(0, -1920, 1440), (1, -2560, 0), (2, 0, 0)]);
     }
 
     #[test]
-    fn nothing_to_swap_with_lid_closed_and_one_monitor() {
+    fn nothing_to_choose_with_lid_closed_and_one_monitor() {
         let paths = [path(1, 2, false)];
         let modes = [ModeInfo::default(), mode(5120, 2160, 0, 0)];
-        assert!(!plan_layout(&paths, &modes, false).swappable);
+        let plan = plan_layout(&paths, &modes, None, false);
+        assert!(!plan.dual);
+        assert_eq!(plan.laptop, None);
     }
 
     #[test]
-    fn ultrawide_pair_uses_default_layout() {
+    fn ultrawide_pair_is_a_row() {
         let paths = [path(0, 1, true), path(1, 2, false), path(2, 3, false)];
         let modes = [mode(3840, 2400, 0, 0), mode(5120, 2160, 0, 0), mode(2560, 1440, 5120, 0)];
-        let mut plan = plan_layout(&paths, &modes, false).moves;
-        plan.sort();
-        assert_eq!(plan, vec![(0, -3840, 1080), (1, 0, 0), (2, 5120, 0)]);
+        let plan = plan_layout(&paths, &modes, None, false);
+        assert!(!plan.dual);
+        assert_eq!(sorted(plan.moves), vec![(0, -3840, 1080), (1, 0, 0), (2, 5120, 0)]);
     }
 
     #[test]
     fn two_externals_with_lid_closed() {
         let paths = [path(1, 2, false), path(2, 3, false)];
         let modes = [ModeInfo::default(), mode(2560, 1440, 0, 0), mode(2560, 1440, 2560, 0)];
-        let mut plan = plan_layout(&paths, &modes, false).moves;
-        plan.sort();
-        assert_eq!(plan, vec![(1, -2560, 0), (2, 0, 0)]);
+        let plan = plan_layout(&paths, &modes, None, false);
+        assert_eq!(sorted(plan.moves), vec![(1, -2560, 0), (2, 0, 0)]);
     }
 
     #[test]
     fn no_plan_without_external() {
         let paths = [path(0, 1, true)];
         let modes = [mode(3840, 2400, 0, 0)];
-        assert_eq!(plan_layout(&paths, &modes, false), Plan::default());
+        assert_eq!(plan_layout(&paths, &modes, None, false), Plan::default());
     }
 
+    #[test]
+    fn reads_size_from_edid() {
+        let mut edid = [0u8; 128];
+        edid[21] = 93;
+        edid[22] = 39;
+        assert_eq!(edid_size(&edid), Some((930.0, 390.0)));
+        // Detailed timing: 977 x 412 mm.
+        edid[54] = 0x01;
+        edid[66] = (977 & 0xff) as u8;
+        edid[67] = (412 & 0xff) as u8;
+        edid[68] = (((977 >> 8) << 4) | (412 >> 8)) as u8;
+        assert_eq!(edid_size(&edid), Some((977.0, 412.0)));
+    }
     #[test]
     fn relative_scale_from_recommended() {
         // Recommended 150% (index 2): min_rel is -2.

@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod config;
 mod display;
 mod fix;
 mod install;
@@ -23,7 +24,10 @@ Usage: auto-display <command>
   apply       Fix the displays now if they are duplicated, with the on-screen card
   setup       Same as apply, without a console (what the watcher starts)
   layout      Apply the layout and scaling now, even if not duplicated
-  swap        Swap sides: the two monitors, or the laptop to the other side of the monitor
+  laptop left|right|below
+              Move the laptop screen to that side of the external monitors
+  swap        Swap the two external monitors
+  config      Create config.toml if needed and print its path
   watch       Run the watcher in this session (what the sign-in entry runs)
   preview [dual|single|done|error]
               Play the on-screen card with made-up screens; changes nothing";
@@ -49,11 +53,18 @@ fn main() {
             }
         }),
         "layout" => fix::apply_layout().map(|_| ()),
-        "swap" => fix::arrange(true).map(|a| {
-            if !a.swappable {
-                println!("Nothing to swap with this set of screens.");
+        "laptop" => match args.get(1).map(String::as_str) {
+            Some("left") => fix::arrange(Some(display::Side::Left), false).map(|_| ()),
+            Some("right") => fix::arrange(Some(display::Side::Right), false).map(|_| ()),
+            Some("below") => fix::arrange(Some(display::Side::Below), false).map(|_| ()),
+            _ => Err("usage: auto-display laptop left|right|below".into()),
+        },
+        "swap" => fix::arrange(None, true).map(|a| {
+            if !a.dual {
+                println!("Only two side-by-side monitors can be swapped.");
             }
         }),
+        "config" => config::ensure().map(|p| println!("{}", p.display())),
         "preview" => ui::preview(args.get(1).map(String::as_str).unwrap_or("dual")),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
@@ -91,7 +102,17 @@ fn status() -> Result<(), String> {
             None => println!("  {} {}", display::gdi_name(p), display::monitor_name(p)),
         }
     }
+    for s in display::screens().unwrap_or_default() {
+        match s.mm {
+            Some((w, h)) => {
+                let inches = (w * w + h * h).sqrt() / 25.4;
+                println!("  {} is {w:.0} x {h:.0} mm ({inches:.1}\")", s.name);
+            }
+            None => println!("  {}: physical size unknown", s.name),
+        }
+    }
     println!("Watcher: {}", if watch::is_running() { "running" } else { "not running" });
+    println!("Config: {}", config::path().display());
     println!("Log: {}", log::path().display());
     Ok(())
 }

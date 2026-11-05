@@ -41,6 +41,7 @@ pub fn install() -> Result<(), String> {
         }
     }
 
+    crate::config::ensure()?;
     let command = format!("\"{}\" watch", target.display());
     let data = watch::wide(&command);
     let rc = unsafe {
