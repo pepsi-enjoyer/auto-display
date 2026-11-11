@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne $env:TAG) {
+            throw "Tag $env:TAG does not match Cargo.toml version $version"
+          }
+
+      - name: Check the installer on Windows PowerShell
+        shell: powershell
+        run: .\tests\install.ps1
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Publish Windows executable and checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash target/release/auto-display.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  auto-display.exe" | Set-Content target/release/SHA256SUMS -Encoding ascii
+          gh release view $env:TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG target/release/auto-display.exe target/release/SHA256SUMS install.ps1 --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $env:TAG target/release/auto-display.exe target/release/SHA256SUMS install.ps1 --verify-tag --title "auto-display $env:TAG" --generate-notes --repo $env:GITHUB_REPOSITORY
+          }

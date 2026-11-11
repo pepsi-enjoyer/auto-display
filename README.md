@@ -25,12 +25,28 @@ monitors** if two monitors are the wrong way round. **Keep**, or wait 10 seconds
 
 ## Install
 
+Run this in PowerShell on 64-bit Windows:
+
 ```powershell
-cargo build --release
-.\target\release\auto-display.exe install
+irm https://raw.githubusercontent.com/pepsi-enjoyer/auto-display/master/install.ps1 | iex
 ```
 
-This starts it now and at every sign-in. It doesn't need admin rights.
+This downloads the [latest release](https://github.com/pepsi-enjoyer/auto-display/releases/latest),
+checks its SHA-256 checksum, and installs it to `%LOCALAPPDATA%\auto-display`. It starts now and at
+every sign-in. No Rust or admin rights are needed. Run the same command again to update; your
+settings are kept.
+
+You can also download `auto-display.exe` from the release and run `.\auto-display.exe install`.
+
+Or build and install with [Rust](https://rustup.rs):
+
+```powershell
+cargo install --git https://github.com/pepsi-enjoyer/auto-display --locked
+auto-display install
+```
+
+For the commands below, use `& "$env:LOCALAPPDATA\auto-display\auto-display.exe"` if `auto-display`
+is not on your PATH.
 
 ## Settings
 
