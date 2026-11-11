@@ -731,7 +731,8 @@ fn draw_screens(ui: &egui::Ui, painter: &Painter, area: Rect, screens: &[Screen]
 
     let ctx = ui.ctx();
     let animate = |key: &str, target: Rect| {
-        let id = Id::new(("screen", key));
+        // Viewports share an animation manager, but DPI rounding can give each a different target.
+        let id = Id::new(("screen", ctx.viewport_id(), key));
         let a = |k: &str, v: f32| ctx.animate_value_with_time(id.with(k), v, 0.35);
         Rect::from_min_size(pos2(a("x", target.left()), a("y", target.top())), vec2(a("w", target.width()), a("h", target.height())))
     };
@@ -815,9 +816,7 @@ fn button(ui: &egui::Ui, painter: &Painter, rect: Rect, id: &str, label: &str, p
     let hovered = response.hovered();
     let radius = CornerRadius::same(10);
     if primary {
-        let (a, b) = if hovered { (ACCENT_HOVER, ACCENT) } else { (ACCENT, Color32::from_rgb(0x6a, 0x5a, 0xf0)) };
-        painter.rect_filled(rect, radius, b);
-        vgradient(&painter.with_clip_rect(rect.shrink(1.0)), rect.shrink(1.0), a, b);
+        painter.rect_filled(rect, radius, if hovered { ACCENT_HOVER } else { ACCENT });
         painter.rect_stroke(rect, radius, Stroke::new(1.0, ACCENT_HOVER.gamma_multiply(0.6)), StrokeKind::Inside);
     } else {
         painter.rect_filled(rect, radius, if hovered { BUTTON_HOVER } else { BUTTON });
@@ -1011,5 +1010,96 @@ mod tests {
         // Below ghost: centred under the monitor.
         assert!((ghosts[1].center().x - 977.0 / 2.0).abs() < 0.01);
         assert_eq!(ghosts[1].top(), 412.0);
+    }
+
+    fn paint_frame(
+        ctx: &egui::Context,
+        viewport: ViewportId,
+        size: Vec2,
+        time: f64,
+        paint: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            viewport_id: viewport,
+            viewports: [(viewport, egui::ViewportInfo::default())].into_iter().collect(),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut paint = paint;
+        let mut output = ctx.run_ui(input, |ui| paint(ui));
+        output.textures_delta.clear();
+        output
+    }
+
+    fn screen_rects(output: &egui::FullOutput) -> Vec<Rect> {
+        output.shapes.iter().filter_map(|s| match &s.shape {
+            Shape::Rect(r) if r.fill == BEZEL => Some(r.rect),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn screen_animations_are_independent_on_each_monitor() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let screens = Preview { kind: "dual".into(), laptop: Side::Below, swapped: false }.screens();
+        // Different DPI rounding/window sizes give each viewport different diagram coordinates.
+        let viewports = [
+            (ViewportId::ROOT, vec2(WIDTH, HEIGHT)),
+            (ViewportId::from_hash_of("second monitor"), vec2(WIDTH - 1.0, HEIGHT - 1.0)),
+        ];
+        let mut expected = Vec::new();
+        for (viewport, size) in viewports {
+            let isolated = egui::Context::default();
+            install_fonts(&isolated);
+            let output = paint_frame(&isolated, viewport, size, 0.0, |ui| {
+                draw(ui, &Phase::Prompt, Instant::now(), &screens);
+            });
+            let rects = screen_rects(&output);
+            assert_eq!(rects.len(), screens.len());
+            expected.push(rects);
+        }
+        for frame in 0..120 {
+            for (i, (viewport, size)) in viewports.into_iter().enumerate() {
+                let output = paint_frame(&ctx, viewport, size, frame as f64 / 60.0, |ui| {
+                    draw(ui, &Phase::Prompt, Instant::now(), &screens);
+                });
+                assert_eq!(screen_rects(&output), expected[i], "frame {frame}, monitor {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn button_fill_stays_inside_rounded_corners() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        ctx.tessellation_options_mut(|o| o.prerasterized_discs = false);
+        let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(118.0, 34.0));
+        for primary in [false, true] {
+            let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), 0.0, |ui| {
+                button(ui, ui.painter(), rect, "test button", "Keep", primary);
+            });
+            let meshes = ctx.tessellate(output.shapes, output.pixels_per_point);
+            let covered = |point: Pos2| meshes.iter().any(|p| {
+                let egui::epaint::Primitive::Mesh(mesh) = &p.primitive else { return false };
+                mesh.indices.chunks_exact(3).any(|t| {
+                    let vertices = [t[0], t[1], t[2]].map(|i| mesh.vertices[i as usize]);
+                    if vertices.iter().all(|v| v.color.a() == 0) {
+                        return false;
+                    }
+                    let [a, b, c] = vertices.map(|v| v.pos);
+                    let cross = |u: Vec2, v: Vec2| u.x * v.y - u.y * v.x;
+                    let sides = [cross(b - a, point - a), cross(c - b, point - b), cross(a - c, point - c)];
+                    sides.iter().all(|s| *s > 0.0) || sides.iter().all(|s| *s < 0.0)
+                })
+            });
+            assert!(covered(rect.center() + vec2(35.0, 0.5)), "button fill is missing");
+            for corner in [rect.left_top(), rect.right_top(), rect.left_bottom(), rect.right_bottom()] {
+                let direction = rect.center() - corner;
+                let point = corner + vec2(direction.x.signum(), direction.y.signum()) * 2.0;
+                assert!(!covered(point), "square fill at {point:?}, primary = {primary}");
+            }
+        }
     }
 }
