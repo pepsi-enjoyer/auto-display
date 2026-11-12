@@ -455,7 +455,6 @@ fn ease_out(t: f32) -> f32 {
 /// What the prompt is about, worked out from the screens on the card.
 struct Choices {
     dual: bool,
-    laptop: Option<Screen>,
     /// Faded laptops wherever the laptop is not.
     ghosts: Vec<(Side, Screen)>,
 }
@@ -474,7 +473,7 @@ fn choices(screens: &[Screen]) -> Choices {
             ghosts.push((side, Screen { id, x, y, primary: false, ..l.clone() }));
         }
     }
-    Choices { dual: display::is_dual(&externals), laptop, ghosts }
+    Choices { dual: display::is_dual(&externals), ghosts }
 }
 
 fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen]) -> Option<Action> {
@@ -517,7 +516,7 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen]) ->
     let text_w = rect.right() - PAD - text_x;
     let (title, subtitle) = match phase {
         Phase::Working(step) => ("Setting up your displays".to_string(), format!("{step}{}", dots(t))),
-        Phase::Prompt => prompt_text(screens, choices.as_ref().unwrap()),
+        Phase::Prompt => ("Is everything in the right place?".into(), "Adjust the layout below, then choose Keep.".into()),
         Phase::Done(summary) => ("Displays ready".to_string(), summary.clone()),
         Phase::Failed(e) => ("Couldn't set up your displays".to_string(), e.clone()),
     };
@@ -631,22 +630,6 @@ fn draw_icon(painter: &Painter, c: Pos2, phase: &Phase, since: Instant, t: f32) 
 
 fn dots(t: f32) -> &'static str {
     ["", ".", "..", "..."][((t * 2.5) as usize) % 4]
-}
-
-fn prompt_text(screens: &[Screen], choices: &Choices) -> (String, String) {
-    match (choices.laptop.is_some(), choices.dual) {
-        (true, true) => ("Is everything in the right place?".into(), "Click a faded laptop to move it, or swap the monitors.".into()),
-        (true, false) => ("Is your laptop in the right place?".into(), "Click a faded laptop to move it there.".into()),
-        _ => {
-            let mut externals: Vec<_> = screens.iter().filter(|s| !s.internal).collect();
-            externals.sort_by_key(|s| s.x);
-            let sub = match externals.as_slice() {
-                [left, right] if left.name != right.name => format!("{} should be on your left, {} on your right.", left.name, right.name),
-                _ => "The main display should be the one on your right.".into(),
-            };
-            ("Are your monitors the right way round?".into(), sub)
-        }
-    }
 }
 
 /// Size of a screen's picture in millimetres, from its EDID, or a guess from its pixels.
@@ -804,10 +787,10 @@ fn draw_ghost(painter: &Painter, r: Rect, hovered: bool) {
     dashed(r);
     let deck = Rect::from_min_max(pos2(r.left() - 6.0, r.bottom() + 1.0), pos2(r.right() + 6.0, r.bottom() + 5.0));
     dashed(deck);
-    let font = regular(12.0);
-    let options: &[&str] = if hovered { &["Move here", "Move"] } else { &["Laptop here?", "Here?"] };
-    let width = |s: &str| painter.layout_no_wrap(s.to_owned(), font.clone(), TEXT).size().x;
-    let text = options.iter().find(|s| width(s) <= r.width() - 10.0).copied().unwrap_or("");
+    let text = "Move here";
+    let width = painter.layout_no_wrap(text.into(), regular(12.0), TEXT).size().x;
+    let scale = ((r.width() - 10.0).max(1.0) / width).min(1.0);
+    let font = regular(12.0 * scale);
     painter.text(r.center(), Align2::CENTER_CENTER, text, font, if hovered { TEXT } else { MUTED });
 }
 

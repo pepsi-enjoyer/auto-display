@@ -1,6 +1,6 @@
 [package]
 name = "auto-display"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Switches a docked Windows laptop from duplicate to extend, makes the external monitor primary and sets its scaling"
 publish = false
