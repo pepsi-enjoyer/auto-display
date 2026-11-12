@@ -2,6 +2,7 @@
 # irm https://raw.githubusercontent.com/pepsi-enjoyer/auto-display/master/install.ps1 | iex
 & {
     $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         throw 'auto-display requires Windows.'
     }
@@ -28,7 +29,9 @@
             throw 'The download checksum does not match. Run the install command again.'
         }
 
-        $installer = Start-Process -FilePath $exe -ArgumentList install -WindowStyle Hidden -Wait -PassThru
+        # Start-Process -Wait also waits for descendants, including the long-running watcher.
+        $installer = Start-Process -FilePath $exe -ArgumentList install -WindowStyle Hidden -PassThru
+        $installer.WaitForExit()
         if ($installer.ExitCode -ne 0) {
             throw "Installation failed (exit $($installer.ExitCode)). See %LOCALAPPDATA%\auto-display\auto-display.log."
         }

@@ -24,13 +24,16 @@ function Invoke-WebRequest {
 function Start-Process {
     param([string]$FilePath, [string]$ArgumentList, [string]$WindowStyle, [switch]$Wait, [switch]$PassThru)
     if (-not (Test-Path -LiteralPath $FilePath) -or $ArgumentList -ne 'install' -or
-        $WindowStyle -ne 'Hidden' -or -not $Wait -or -not $PassThru) {
+        $WindowStyle -ne 'Hidden' -or $Wait -or -not $PassThru) {
         throw 'Unexpected installer launch arguments.'
     }
     $script:launchCount++
-    $code = 0
-    if ($script:scenario -eq 'install failure') { $code = 1 }
-    [pscustomobject]@{ ExitCode = $code }
+    $process = [pscustomobject]@{ ExitCode = $null }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+        $script:waitCount++
+        $this.ExitCode = 0
+        if ($script:scenario -eq 'install failure') { $this.ExitCode = 1 }
+    } -PassThru
 }
 
 $cases = @(
@@ -45,6 +48,7 @@ foreach ($case in $cases) {
     $script:scenario = $case.Name
     $script:downloadDir = $null
     $script:launchCount = 0
+    $script:waitCount = 0
     $failure = $null
     try { . $installerScript } catch { $failure = $_.Exception.Message }
     if ($case.Error) {
@@ -56,6 +60,9 @@ foreach ($case in $cases) {
     }
     if ($script:launchCount -ne $case.Launches) {
         throw "$($case.Name): expected $($case.Launches) launches, got $script:launchCount"
+    }
+    if ($script:waitCount -ne $case.Launches) {
+        throw "$($case.Name): did not wait for the installer process"
     }
     if (-not $script:downloadDir -or (Test-Path -LiteralPath $script:downloadDir)) {
         throw "$($case.Name): temporary downloads were not cleaned up"
