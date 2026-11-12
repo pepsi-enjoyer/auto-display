@@ -17,6 +17,9 @@ external_scale = 150
 
 # Scaling for the laptop screen. Leave commented out to keep what Windows chose.
 # laptop_scale = 250
+
+# Check GitHub for updates automatically.
+auto_update = true
 ";
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -24,11 +27,12 @@ external_scale = 150
 pub struct Config {
     pub external_scale: Option<u32>,
     pub laptop_scale: Option<u32>,
+    pub auto_update: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { external_scale: Some(150), laptop_scale: None }
+        Config { external_scale: Some(150), laptop_scale: None, auto_update: true }
     }
 }
 
@@ -84,7 +88,13 @@ mod tests {
     #[test]
     fn reads_both_scales() {
         let c = parse("external_scale = 125\nlaptop_scale = 200\n").unwrap();
-        assert_eq!(c, Config { external_scale: Some(125), laptop_scale: Some(200) });
+        assert_eq!(c, Config { external_scale: Some(125), laptop_scale: Some(200), auto_update: true });
+    }
+
+    #[test]
+    fn existing_settings_enable_updates_and_can_opt_out() {
+        assert!(parse("external_scale = 150\n").unwrap().auto_update);
+        assert!(!parse("auto_update = false\n").unwrap().auto_update);
     }
 
     #[test]

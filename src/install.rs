@@ -93,8 +93,9 @@ pub fn uninstall() -> Result<(), String> {
     if rc != 0 && rc != 2 {
         return Err(format!("could not remove the sign-in entry (error {rc})"));
     }
-    let exe = log::data_dir().join("auto-display.exe");
-    let _ = fs::remove_file(&exe);
+    for name in ["auto-display.exe", "auto-display.exe.old", "auto-display.exe.new"] {
+        let _ = fs::remove_file(log::data_dir().join(name));
+    }
     log::line(&format!(
         "Uninstalled{}. Log kept at {}.",
         if was_running { " and stopped the running copy" } else { "" },

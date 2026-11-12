@@ -1,6 +1,6 @@
 [package]
 name = "auto-display"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Switches a docked Windows laptop from duplicate to extend, makes the external monitor primary and sets its scaling"
 publish = false
@@ -8,8 +8,12 @@ publish = false
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
 raw-window-handle = "0.6"
+semver = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
 toml = "1"
+ureq = { version = "3", default-features = false, features = ["json", "native-tls"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

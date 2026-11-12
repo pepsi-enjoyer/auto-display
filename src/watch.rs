@@ -5,16 +5,16 @@ use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, GetLastError, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, KillTimer, MSG,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, GetWindowThreadProcessId, KillTimer, MSG,
     PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage, WM_CLOSE, WM_DESTROY,
     WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
-use crate::{display, fix, install, log};
+use crate::{display, fix, install, log, update};
 
 const CLASS_NAME: &str = "auto-display-watcher";
 const MUTEX_NAME: &str = "Local\\auto-display";
@@ -35,6 +35,20 @@ struct State {
     checks_left: u32,
 }
 
+impl State {
+    fn observe(&mut self, monitors: Vec<String>) -> bool {
+        if self.monitors.as_ref() != Some(&monitors) {
+            self.monitors = Some(monitors);
+            self.checks_left = RECHECKS;
+        }
+        if self.checks_left == 0 {
+            return false;
+        }
+        self.checks_left -= 1;
+        true
+    }
+}
+
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
 }
@@ -44,14 +58,44 @@ pub fn wide(s: &str) -> Vec<u16> {
 }
 
 pub fn run() -> Result<(), String> {
+    run_with_initial_check(true)
+}
+
+/// Wait for the old watcher to release its mutex, then resume without changing the display layout.
+pub fn resume_after_update(parent: u32) -> Result<(), String> {
+    if parent != 0 {
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, parent) };
+        if process.is_null() {
+            if unsafe { GetLastError() } != ERROR_INVALID_PARAMETER {
+                return Err("could not wait for the previous watcher".into());
+            }
+        } else {
+            let status = unsafe { WaitForSingleObject(process, 60_000) };
+            unsafe { CloseHandle(process) };
+            if status != WAIT_OBJECT_0 {
+                return Err("previous watcher did not exit in time".into());
+            }
+        }
+    }
+    run_with_initial_check(false)
+}
+
+fn run_with_initial_check(initial_check: bool) -> Result<(), String> {
     let mutex_name = wide(MUTEX_NAME);
     let mutex = unsafe { CreateMutexW(null(), 0, mutex_name.as_ptr()) };
     if mutex.is_null() {
         return Err("could not create the single-instance mutex".into());
     }
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(mutex) };
         return Ok(()); // Already running.
     }
+
+    if !initial_check {
+        let monitors = display::connected_monitors()?;
+        STATE.with(|s| *s.borrow_mut() = State { monitors: Some(monitors), checks_left: 0 });
+    }
+    update::cleanup();
 
     let class = wide(CLASS_NAME);
     unsafe {
@@ -78,7 +122,8 @@ pub fn run() -> Result<(), String> {
         if hwnd.is_null() {
             return Err("CreateWindowExW failed".into());
         }
-        log::line("Watching for display changes.");
+        log::line(&format!("Watching for display changes ({}).", update::CURRENT));
+        update::start();
         SetTimer(hwnd, TIMER_CHECK, SETTLE_MS, None);
         SetTimer(hwnd, TIMER_POLL, POLL_MS, None);
 
@@ -89,6 +134,7 @@ pub fn run() -> Result<(), String> {
         }
     }
     log::line("Stopped.");
+    unsafe { CloseHandle(mutex) };
     Ok(())
 }
 
@@ -130,17 +176,12 @@ fn check(hwnd: HWND) {
     };
     let act = STATE.with(|s| {
         let mut s = s.borrow_mut();
-        if s.monitors.as_ref() != Some(&monitors) {
-            if s.monitors.is_some() {
-                log::line(&format!("Connected displays changed ({} now).", monitors.len()));
-            }
-            s.monitors = Some(monitors);
-            s.checks_left = RECHECKS;
+        if s.monitors.as_ref().is_some_and(|old| old != &monitors) {
+            log::line(&format!("Connected displays changed ({} now).", monitors.len()));
         }
-        if s.checks_left == 0 {
+        if !s.observe(monitors) {
             return false;
         }
-        s.checks_left -= 1;
         if s.checks_left > 0 {
             unsafe { SetTimer(hwnd, TIMER_CHECK, RECHECK_MS, None) };
         }
@@ -189,4 +230,43 @@ pub fn stop_running() -> bool {
 pub fn is_running() -> bool {
     let class = wide(CLASS_NAME);
     !unsafe { FindWindowW(class.as_ptr(), null()) }.is_null()
+}
+
+fn running_window() -> Option<(HWND, u32)> {
+    let class = wide(CLASS_NAME);
+    let hwnd = unsafe { FindWindowW(class.as_ptr(), null()) };
+    if hwnd.is_null() { return None; }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    (pid != 0).then_some((hwnd, pid))
+}
+
+pub fn running_pid() -> Option<u32> {
+    running_window().map(|(_, pid)| pid)
+}
+
+pub fn request_stop(expected_pid: u32) {
+    if let Some((hwnd, pid)) = running_window() && pid == expected_pid {
+        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_restart_preserves_layout_until_monitors_change() {
+        let monitors = vec!["laptop".into(), "external".into()];
+        let mut resumed = State { monitors: Some(monitors.clone()), checks_left: 0 };
+        // An update must leave a user's duplicate/presentation mode alone.
+        assert!(!resumed.observe(monitors.clone()));
+        assert!(!resumed.observe(monitors.clone()));
+        assert!(resumed.observe(vec!["laptop".into(), "new external".into()]));
+        assert_eq!(resumed.checks_left, RECHECKS - 1);
+        let mut signed_in = State::default();
+        assert!(signed_in.observe(monitors.clone()));
+        for _ in 1..RECHECKS { assert!(signed_in.observe(monitors.clone())); }
+        assert!(!signed_in.observe(monitors));
+    }
 }

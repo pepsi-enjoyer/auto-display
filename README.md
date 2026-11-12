@@ -34,7 +34,8 @@ irm https://raw.githubusercontent.com/pepsi-enjoyer/auto-display/master/install.
 This downloads the [latest release](https://github.com/pepsi-enjoyer/auto-display/releases/latest),
 checks its SHA-256 checksum, and installs it to `%LOCALAPPDATA%\auto-display`. It starts now and at
 every sign-in. No Rust or admin rights are needed. Run the same command again to update; your
-settings are kept.
+settings are kept. Once installed, it checks for updates after one minute and every six hours,
+verifies the download, and restarts itself without changing your current display layout.
 
 You can also download `auto-display.exe` from the release and run `.\auto-display.exe install`.
 
@@ -56,6 +57,7 @@ is not on your PATH.
 ```toml
 external_scale = 150   # scaling for external monitors, in percent
 # laptop_scale = 250   # scaling for the laptop screen; leave out to keep what Windows chose
+auto_update = true    # set to false to turn off automatic updates
 ```
 
 ## Commands
@@ -63,6 +65,7 @@ external_scale = 150   # scaling for external monitors, in percent
 | Command | What it does |
 |---|---|
 | `status` | Show your screens, their sizes, and whether auto-display is running |
+| `update` | Check for and install a newer release now |
 | `laptop left\|right\|below` | Move the laptop screen |
 | `swap` | Swap two monitors |
 | `apply` | Fix duplicated screens now |

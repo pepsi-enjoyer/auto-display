@@ -6,6 +6,7 @@ mod fix;
 mod install;
 mod log;
 mod ui;
+mod update;
 mod watch;
 
 use windows_sys::Win32::System::Console::AttachConsole;
@@ -21,6 +22,7 @@ Usage: auto-display <command>
   install     Copy to %LOCALAPPDATA%\\auto-display, run at every sign-in, and start now
   uninstall   Stop it and remove the sign-in entry
   status      Show the connected displays and whether the watcher is running
+  update      Check GitHub for a newer release and install it now
   apply       Fix the displays now if they are duplicated, with the on-screen card
   setup       Same as apply, without a console (what the watcher starts)
   layout      Apply the layout and scaling now, even if not duplicated
@@ -42,10 +44,19 @@ fn main() {
     }
 
     let result = match command {
+        "watch" if args.get(1).is_some_and(|a| a == "--updated") => match args.get(2).and_then(|a| a.parse().ok()) {
+            Some(parent) => watch::resume_after_update(parent),
+            None => Err("Missing process ID for update restart".into()),
+        },
         "watch" => watch::run(),
         "install" => install::install(),
         "uninstall" => install::uninstall(),
         "status" => status(),
+        "update" => update::run(),
+        "--version" | "-V" => {
+            println!("auto-display {}", update::CURRENT);
+            Ok(())
+        }
         "setup" => ui::run().map(|_| ()),
         "apply" => ui::run().map(|fixed| {
             if !fixed {
@@ -79,6 +90,7 @@ fn main() {
 }
 
 fn status() -> Result<(), String> {
+    println!("auto-display {}", update::CURRENT);
     let cfg = display::active()?;
     println!(
         "Mode: {}",

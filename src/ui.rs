@@ -951,6 +951,10 @@ fn find_window(title: &str) -> Option<isize> {
     (!h.is_null()).then_some(h as isize)
 }
 
+pub fn is_open() -> bool {
+    find_window("auto-display").is_some()
+}
+
 fn centre_in(h: isize, work: RECT) {
     let hwnd = h as HWND;
     unsafe {
