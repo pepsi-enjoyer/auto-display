@@ -14,8 +14,8 @@ use std::thread::{sleep, spawn};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Id, Key, Mesh,
-    Painter, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2, ViewportBuilder, ViewportCommand, ViewportId, pos2,
+    self, Align2, Color32, CornerRadius, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Id, Key, Painter,
+    Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2, ViewportBuilder, ViewportCommand, ViewportId, pos2,
     vec2,
 };
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, RECT};
@@ -38,26 +38,25 @@ const DONE_FOR: Duration = Duration::from_millis(2800);
 const FAILED_FOR: Duration = Duration::from_secs(10);
 const FADE_IN: f32 = 0.22;
 const FADE_OUT: f32 = 0.25;
-/// The card is slightly see-through (whole-window opacity, out of 255).
-const OPACITY: f32 = 236.0;
+/// Time between frames. The card paces itself rather than waiting on vsync: with a window on every
+/// monitor, each window's vsync wait would add up and divide the frame rate by the monitor count.
+const FRAME: Duration = Duration::from_millis(8);
 
-const BG_TOP: Color32 = Color32::from_rgb(0x1b, 0x1d, 0x26);
-const BG_BOTTOM: Color32 = Color32::from_rgb(0x11, 0x12, 0x17);
-const SURFACE: Color32 = Color32::from_rgb(0x17, 0x19, 0x20);
-const SURFACE_EDGE: Color32 = Color32::from_rgb(0x25, 0x28, 0x32);
-const BEZEL: Color32 = Color32::from_rgb(0x0c, 0x0d, 0x11);
-const PANEL_TOP: Color32 = Color32::from_rgb(0x34, 0x39, 0x4a);
-const PANEL_BOTTOM: Color32 = Color32::from_rgb(0x22, 0x26, 0x31);
-const SCREEN_EDGE: Color32 = Color32::from_rgb(0x3a, 0x40, 0x4e);
-const BUTTON: Color32 = Color32::from_rgb(0x24, 0x28, 0x32);
-const BUTTON_HOVER: Color32 = Color32::from_rgb(0x2f, 0x34, 0x41);
-const TEXT: Color32 = Color32::from_rgb(0xf2, 0xf4, 0xf8);
-const MUTED: Color32 = Color32::from_rgb(0x8b, 0x93, 0xa3);
-const ACCENT: Color32 = Color32::from_rgb(0x7c, 0x6c, 0xff);
-const ACCENT_HOVER: Color32 = Color32::from_rgb(0x96, 0x89, 0xff);
-const ACCENT_2: Color32 = Color32::from_rgb(0x22, 0xd3, 0xee);
-const GOOD: Color32 = Color32::from_rgb(0x34, 0xd3, 0x99);
-const BAD: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
+const BG: Color32 = Color32::from_rgb(0x1b, 0x1c, 0x1f);
+const SURFACE: Color32 = Color32::from_rgb(0x15, 0x16, 0x18);
+const SURFACE_EDGE: Color32 = Color32::from_rgb(0x2a, 0x2c, 0x30);
+const SCREEN: Color32 = Color32::from_rgb(0x2d, 0x30, 0x36);
+const SCREEN_EDGE: Color32 = Color32::from_rgb(0x47, 0x4a, 0x52);
+const BUTTON: Color32 = Color32::from_rgb(0x2b, 0x2d, 0x32);
+const BUTTON_HOVER: Color32 = Color32::from_rgb(0x36, 0x39, 0x40);
+const TEXT: Color32 = Color32::from_rgb(0xf2, 0xf3, 0xf5);
+const MUTED: Color32 = Color32::from_rgb(0x93, 0x97, 0xa1);
+const ACCENT: Color32 = Color32::from_rgb(0x3d, 0x7e, 0xea);
+const ACCENT_HOVER: Color32 = Color32::from_rgb(0x5a, 0x94, 0xf0);
+/// The accent, lightened to read as text on the dark card.
+const ACCENT_TEXT: Color32 = Color32::from_rgb(0x8a, 0xb4, 0xf8);
+const GOOD: Color32 = Color32::from_rgb(0x4c, 0xc3, 0x8a);
+const BAD: Color32 = Color32::from_rgb(0xf0, 0x6a, 0x6a);
 
 #[derive(Clone, PartialEq)]
 enum Phase {
@@ -220,7 +219,10 @@ fn show(
         screens,
     }));
     let started = Arc::new(AtomicBool::new(false));
-    let options = eframe::NativeOptions { viewport: card_viewport("auto-display").with_app_id("auto-display"), ..Default::default() };
+    let options = eframe::NativeOptions { viewport: card_viewport("auto-display").with_app_id("auto-display"),
+        glow_options: egui_glow_config(),
+        ..Default::default()
+    };
     let (app_state, app_started) = (state.clone(), started.clone());
     let result = eframe::run_native(
         "auto-display",
@@ -237,6 +239,12 @@ fn show(
         log::line(&format!("Could not show the setup card: {e}"));
     }
     Ok(started.load(Ordering::SeqCst))
+}
+
+fn egui_glow_config() -> eframe::egui_glow::GlowConfiguration {
+    let mut config = eframe::egui_glow::GlowConfiguration::default();
+    config.vsync = false;
+    config
 }
 
 fn card_viewport(title: &str) -> ViewportBuilder {
@@ -386,7 +394,7 @@ impl Card {
 
 impl eframe::App for Card {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        BG_BOTTOM.to_normalized_gamma_f32()
+        BG.to_normalized_gamma_f32()
     }
 
     /// Window management lives here because `ui` does not run while the window is hidden.
@@ -396,7 +404,7 @@ impl eframe::App for Card {
         self.monitors = monitors();
         let fade_in = self.shown.map_or(0.0, |t| (now - t).as_secs_f32() / FADE_IN).clamp(0.0, 1.0);
         let fade_out = self.closing.map_or(1.0, |t| 1.0 - (now - t).as_secs_f32() / FADE_OUT).clamp(0.0, 1.0);
-        self.alpha = (ease_out(fade_in) * fade_out * OPACITY).round() as u8;
+        self.alpha = (ease_out(fade_in) * fade_out * 255.0).round() as u8;
 
         self.manage(ctx, ViewportId::ROOT, hwnd(frame), 0);
         if self.windows.get(&ViewportId::ROOT).is_none_or(|w| w.hwnd.is_none()) {
@@ -418,7 +426,7 @@ impl eframe::App for Card {
             Phase::Prompt if since.elapsed() >= KEEP_AFTER && self.closing.is_none() => self.act(Action::Keep, ctx),
             _ => {}
         }
-        ctx.request_repaint_after(Duration::from_millis(16));
+        ctx.request_repaint_after(FRAME);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -482,33 +490,7 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen]) ->
     let t = ui.input(|i| i.time) as f32;
     let choices = (*phase == Phase::Prompt).then(|| choices(screens));
 
-    // Background: a soft vertical gradient with a faint glow behind the icon.
-    vgradient(&painter, rect, BG_TOP, BG_BOTTOM);
-    let glow_colour = match phase {
-        Phase::Done(_) => GOOD,
-        Phase::Failed(_) => BAD,
-        _ => ACCENT,
-    };
-    for i in 0..10 {
-        painter.circle_filled(rect.min + vec2(PAD + 24.0, 58.0), 30.0 + i as f32 * 14.0, glow_colour.gamma_multiply(0.012));
-    }
-
-    // Accent bar along the top edge.
-    let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 3.0));
-    match phase {
-        Phase::Working(_) => {
-            gradient(&painter, bar, &[(0.0, ACCENT.gamma_multiply(0.35)), (1.0, ACCENT_2.gamma_multiply(0.35))]);
-            let p = (t * 0.55).fract() * 1.6 - 0.3;
-            let clipped = painter.with_clip_rect(bar);
-            gradient(&clipped, bar, &[(p - 0.25, Color32::TRANSPARENT), (p, ACCENT_2), (p + 0.25, Color32::TRANSPARENT)]);
-        }
-        Phase::Prompt => gradient(&painter, bar, &[(0.0, ACCENT), (1.0, ACCENT_2)]),
-        Phase::Done(_) => gradient(&painter, bar, &[(0.0, GOOD), (1.0, ACCENT_2)]),
-        Phase::Failed(_) => {
-            painter.rect_filled(bar, CornerRadius::ZERO, BAD);
-        }
-    }
-
+    painter.rect_filled(rect, CornerRadius::ZERO, BG);
     draw_icon(&painter, rect.min + vec2(PAD + 24.0, 58.0), phase, since, t);
 
     // Title and subtitle.
@@ -528,8 +510,8 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen]) ->
 
     // Diagram of the screens, drawn to physical scale.
     let area = Rect::from_min_max(pos2(rect.left() + PAD, rect.top() + 100.0), pos2(rect.right() - PAD, rect.bottom() - 70.0));
-    painter.rect_filled(area, CornerRadius::same(14), SURFACE.gamma_multiply(0.85));
-    painter.rect_stroke(area, CornerRadius::same(14), Stroke::new(1.0, SURFACE_EDGE), StrokeKind::Inside);
+    painter.rect_filled(area, CornerRadius::same(10), SURFACE);
+    painter.rect_stroke(area, CornerRadius::same(10), Stroke::new(1.0, SURFACE_EDGE), StrokeKind::Inside);
     let ghosts = choices.as_ref().map_or(&[][..], |c| &c.ghosts[..]);
     let mut action = draw_screens(ui, &painter, area.shrink2(vec2(22.0, 18.0)), screens, ghosts).map(Action::MoveLaptop);
 
@@ -558,7 +540,7 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen]) ->
             let track = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 3.0), rect.max);
             painter.rect_filled(track, CornerRadius::ZERO, BUTTON);
             let fill = Rect::from_min_size(track.min, vec2(track.width() * left / KEEP_AFTER.as_secs_f32(), track.height()));
-            gradient(&painter.with_clip_rect(fill), track, &[(0.0, ACCENT), (1.0, ACCENT_2)]);
+            painter.rect_filled(fill, CornerRadius::ZERO, ACCENT);
             ui.input(|i| {
                 if i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape) {
                     action = Some(Action::Keep);
@@ -586,7 +568,6 @@ fn draw_icon(painter: &Painter, c: Pos2, phase: &Phase, since: Instant, t: f32) 
     let r = 20.0;
     match phase {
         Phase::Working(_) => {
-            painter.circle_filled(c, r + 2.0, ACCENT.gamma_multiply(0.10));
             painter.circle_stroke(c, r, Stroke::new(3.0, BUTTON));
             let start = t * 4.2;
             let sweep = 1.6 + 0.9 * (t * 2.1).sin();
@@ -601,7 +582,7 @@ fn draw_icon(painter: &Painter, c: Pos2, phase: &Phase, since: Instant, t: f32) 
         Phase::Prompt => {
             painter.circle_filled(c, r + 2.0, ACCENT.gamma_multiply(0.18));
             // A small screen with a laptop beside it.
-            let s = Stroke::new(2.0, ACCENT_HOVER);
+            let s = Stroke::new(2.0, ACCENT_TEXT);
             let screen = Rect::from_center_size(c + vec2(3.0, -3.0), vec2(16.0, 10.0));
             painter.rect_stroke(screen, CornerRadius::same(2), s, StrokeKind::Middle);
             painter.line_segment([c + vec2(3.0, 2.0), c + vec2(3.0, 5.0)], s);
@@ -737,16 +718,10 @@ fn draw_screens(ui: &egui::Ui, painter: &Painter, area: Rect, screens: &[Screen]
 
 fn draw_screen(painter: &Painter, s: &Screen, r: Rect) {
     let radius = CornerRadius::same(5);
+    painter.rect_filled(r, radius, SCREEN);
     if s.primary {
-        // A soft glow around the main display.
-        for i in 1..=4 {
-            let grow = i as f32 * 2.0;
-            painter.rect_filled(r.expand(grow), CornerRadius::same(5 + i * 2), ACCENT.gamma_multiply(0.05));
-        }
+        painter.rect_filled(r, radius, ACCENT.gamma_multiply(0.14));
     }
-    painter.rect_filled(r, radius, BEZEL);
-    let panel = r.shrink(2.5);
-    vgradient(&painter.with_clip_rect(panel), panel, PANEL_TOP, PANEL_BOTTOM);
     let edge = if s.primary { Stroke::new(1.5, ACCENT) } else { Stroke::new(1.0, SCREEN_EDGE) };
     painter.rect_stroke(r, radius, edge, StrokeKind::Inside);
     if s.internal {
@@ -759,8 +734,8 @@ fn draw_screen(painter: &Painter, s: &Screen, r: Rect) {
     let name = label(painter, &s.name, &name_font, r.width() - 12.0);
     let inches = s.mm.map(|(w, h)| (w * w + h * h).sqrt() / 25.4).filter(|d| *d > 5.0 && !s.name.contains(" + "));
     let detail = match (s.primary, inches) {
-        (true, Some(d)) => Some((format!("Main display · {d:.0}\""), ACCENT_HOVER)),
-        (true, None) => Some(("Main display".to_string(), ACCENT_HOVER)),
+        (true, Some(d)) => Some((format!("Main display · {d:.0}\""), ACCENT_TEXT)),
+        (true, None) => Some(("Main display".to_string(), ACCENT_TEXT)),
         (false, Some(d)) => Some((format!("{d:.0}\""), MUTED)),
         (false, None) => None,
     };
@@ -778,8 +753,10 @@ fn draw_screen(painter: &Painter, s: &Screen, r: Rect) {
 }
 
 fn draw_ghost(painter: &Painter, r: Rect, hovered: bool) {
-    let colour = if hovered { ACCENT_HOVER } else { MUTED.gamma_multiply(0.55) };
-    painter.rect_filled(r, CornerRadius::same(5), ACCENT.gamma_multiply(if hovered { 0.16 } else { 0.04 }));
+    let colour = if hovered { ACCENT_TEXT } else { MUTED.gamma_multiply(0.55) };
+    if hovered {
+        painter.rect_filled(r, CornerRadius::same(5), ACCENT.gamma_multiply(0.16));
+    }
     let dashed = |rect: Rect| {
         let pts = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
         painter.extend(Shape::dashed_line(&pts, Stroke::new(1.2, colour), 5.0, 4.0));
@@ -800,41 +777,12 @@ fn button(ui: &egui::Ui, painter: &Painter, rect: Rect, id: &str, label: &str, p
     let radius = CornerRadius::same(10);
     if primary {
         painter.rect_filled(rect, radius, if hovered { ACCENT_HOVER } else { ACCENT });
-        painter.rect_stroke(rect, radius, Stroke::new(1.0, ACCENT_HOVER.gamma_multiply(0.6)), StrokeKind::Inside);
     } else {
         painter.rect_filled(rect, radius, if hovered { BUTTON_HOVER } else { BUTTON });
         painter.rect_stroke(rect, radius, Stroke::new(1.0, SCREEN_EDGE), StrokeKind::Inside);
     }
     painter.text(rect.center(), Align2::CENTER_CENTER, label, semibold(14.0), TEXT);
     response.clicked()
-}
-
-/// A horizontal gradient through `stops` (position 0..1 across `rect`, colour).
-fn gradient(painter: &Painter, rect: Rect, stops: &[(f32, Color32)]) {
-    let mut mesh = Mesh::default();
-    for (i, &(at, color)) in stops.iter().enumerate() {
-        let x = rect.left() + rect.width() * at;
-        mesh.colored_vertex(pos2(x, rect.top()), color);
-        mesh.colored_vertex(pos2(x, rect.bottom()), color);
-        if i > 0 {
-            let b = i as u32 * 2;
-            mesh.add_triangle(b - 2, b - 1, b);
-            mesh.add_triangle(b - 1, b, b + 1);
-        }
-    }
-    painter.add(Shape::mesh(mesh));
-}
-
-/// A vertical gradient from `top` to `bottom` filling `rect`.
-fn vgradient(painter: &Painter, rect: Rect, top: Color32, bottom: Color32) {
-    let mut mesh = Mesh::default();
-    mesh.colored_vertex(rect.left_top(), top);
-    mesh.colored_vertex(rect.right_top(), top);
-    mesh.colored_vertex(rect.left_bottom(), bottom);
-    mesh.colored_vertex(rect.right_bottom(), bottom);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(1, 2, 3);
-    painter.add(Shape::mesh(mesh));
 }
 
 /// A screen's name if it fits, else just the brand ("DELL"), else as much of the name as fits.
@@ -891,7 +839,7 @@ fn style_window(h: isize) {
     const DWMWCP_ROUND: u32 = 2;
     let colorref = |c: Color32| u32::from_le_bytes([c.r(), c.g(), c.b(), 0]);
     let border = colorref(SCREEN_EDGE);
-    let caption = colorref(BG_TOP);
+    let caption = colorref(BG);
     unsafe {
         DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, (&DWMWCP_ROUND as *const u32).cast(), 4);
         DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR, (&border as *const u32).cast(), 4);
@@ -1021,7 +969,7 @@ mod tests {
 
     fn screen_rects(output: &egui::FullOutput) -> Vec<Rect> {
         output.shapes.iter().filter_map(|s| match &s.shape {
-            Shape::Rect(r) if r.fill == BEZEL => Some(r.rect),
+            Shape::Rect(r) if r.fill == SCREEN => Some(r.rect),
             _ => None,
         }).collect()
     }
