@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, GetLastError, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_CREATED_NEW_KEY, REG_OPTION_VOLATILE, RegCloseKey, RegCreateKeyExW,
+};
 use windows_sys::Win32::System::Threading::{CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, GetWindowThreadProcessId, KillTimer, MSG,
@@ -168,43 +171,70 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 /// Only acts in the moments after the connected monitors change, so choosing duplicate yourself
-/// later (for example to present) is left alone.
+/// later (for example to present) is left alone. The first time there is more than one screen, the
+/// card sets them up whether or not they are duplicated; after that, duplicated screens are fixed
+/// without it.
 fn check(hwnd: HWND) {
     let monitors = match display::connected_monitors() {
         Ok(m) => m,
         Err(e) => return log::line(&format!("error: {e}")),
     };
-    let act = STATE.with(|s| {
+    let act: Option<bool> = STATE.with(|s| {
         let mut s = s.borrow_mut();
         if s.monitors.as_ref().is_some_and(|old| old != &monitors) {
             log::line(&format!("Connected displays changed ({} now).", monitors.len()));
         }
+        let several = monitors.len() > 1;
         if !s.observe(monitors) {
-            return false;
+            return None;
         }
         if s.checks_left > 0 {
             unsafe { SetTimer(hwnd, TIMER_CHECK, RECHECK_MS, None) };
         }
-        true
+        Some(several)
     });
-    if act {
-        match display::active() {
-            Ok(cfg) if display::is_duplicate(&cfg.paths) => start_setup(),
-            Ok(_) => {}
-            Err(e) => log::line(&format!("error: {e}")),
-        }
+    let Some(several) = act else { return };
+    if several && first_card_this_boot() {
+        return start_setup();
+    }
+    let fixed = display::active().and_then(|cfg| match display::is_duplicate(&cfg.paths) {
+        true => fix::if_duplicate(),
+        false => Ok(false),
+    });
+    if let Err(e) = fixed {
+        log::line(&format!("error: {e}"));
     }
 }
 
-/// The fix runs in its own process so it can show the on-screen card. If it cannot be started, fix
-/// the displays here without the card.
+/// True the first time it is called since the user signed in. The marker is a volatile registry
+/// key, which Windows drops at sign-out and so on every shutdown and restart too, even with fast
+/// startup; an uptime check would miss those.
+fn first_card_this_boot() -> bool {
+    let key = wide(r"Software\auto-display\card-shown");
+    let mut handle: HKEY = null_mut();
+    let mut disposition = 0;
+    let rc = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER, key.as_ptr(), 0, null(), REG_OPTION_VOLATILE, KEY_READ, null(), &mut handle, &mut disposition,
+        )
+    };
+    if rc != 0 {
+        log::line(&format!("Could not record that the card was shown (error {rc})."));
+        return true;
+    }
+    unsafe { RegCloseKey(handle) };
+    disposition == REG_CREATED_NEW_KEY
+}
+
+/// The setup runs in its own process so it can show the on-screen card. If it cannot be started,
+/// set the displays up here without the card.
 fn start_setup() {
     let started = std::env::current_exe()
         .map_err(|e| e.to_string())
-        .and_then(|exe| install::start_detached(&format!("\"{}\" setup", exe.display())));
+        .and_then(|exe| install::start_detached(&format!("\"{}\"", exe.display())));
     if let Err(e) = started {
-        log::line(&format!("Could not start the setup card ({e}); fixing without it."));
-        if let Err(e) = fix::if_duplicate() {
+        log::line(&format!("Could not start the setup card ({e}); setting up without it."));
+        if let Err(e) = fix::setup() {
             log::line(&format!("error: {e}"));
         }
     }

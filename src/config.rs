@@ -20,6 +20,10 @@ external_scale = 150
 
 # Check GitHub for updates automatically.
 auto_update = true
+
+# Restart Explorer after changing the scaling, so the taskbar is redrawn at the new size. This
+# closes open File Explorer windows.
+restart_explorer = true
 ";
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -28,11 +32,12 @@ pub struct Config {
     pub external_scale: Option<u32>,
     pub laptop_scale: Option<u32>,
     pub auto_update: bool,
+    pub restart_explorer: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { external_scale: Some(150), laptop_scale: None, auto_update: true }
+        Config { external_scale: Some(150), laptop_scale: None, auto_update: true, restart_explorer: true }
     }
 }
 
@@ -88,13 +93,15 @@ mod tests {
     #[test]
     fn reads_both_scales() {
         let c = parse("external_scale = 125\nlaptop_scale = 200\n").unwrap();
-        assert_eq!(c, Config { external_scale: Some(125), laptop_scale: Some(200), auto_update: true });
+        assert_eq!(c, Config { external_scale: Some(125), laptop_scale: Some(200), auto_update: true, restart_explorer: true });
     }
 
     #[test]
     fn existing_settings_enable_updates_and_can_opt_out() {
         assert!(parse("external_scale = 150\n").unwrap().auto_update);
         assert!(!parse("auto_update = false\n").unwrap().auto_update);
+        assert!(parse("external_scale = 150\n").unwrap().restart_explorer);
+        assert!(!parse("restart_explorer = false\n").unwrap().restart_explorer);
     }
 
     #[test]

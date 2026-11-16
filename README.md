@@ -6,8 +6,13 @@ Dock your Windows laptop and the screens come up duplicated? auto-display fixes 
 - makes the external monitor the main display
 - sets the scaling you choose
 
-It runs at sign-in and whenever you plug in a monitor. If you switch to duplicate yourself later, for
-example to present, it leaves you alone.
+It runs at sign-in and whenever you plug in a monitor. The first time it sees more than one screen
+after you start your PC, it sets them up and shows the card below, duplicated or not. After that it
+only steps in, without the card, when plugging in a monitor leaves the screens duplicated. If you
+switch to duplicate yourself later, for example to present, it leaves you alone.
+
+Windows does not redraw the taskbar properly when the scaling changes, so auto-display restarts
+Explorer after changing it. This closes open File Explorer windows.
 
 ## Layout
 
@@ -46,8 +51,16 @@ cargo install --git https://github.com/pepsi-enjoyer/auto-display --locked
 auto-display install
 ```
 
-For the commands below, use `& "$env:LOCALAPPDATA\auto-display\auto-display.exe"` if `auto-display`
-is not on your PATH.
+## Run it yourself
+
+Once installed, you can set up your screens and bring up the card whenever you like:
+
+```powershell
+& "$env:LOCALAPPDATA\auto-display\auto-display.exe"
+```
+
+That is `auto-display` with no command. The same path works for the commands below if
+`auto-display` is not on your PATH.
 
 ## Settings
 
@@ -58,17 +71,20 @@ is not on your PATH.
 external_scale = 150   # scaling for external monitors, in percent
 # laptop_scale = 250   # scaling for the laptop screen; leave out to keep what Windows chose
 auto_update = true    # set to false to turn off automatic updates
+restart_explorer = true   # set to false to leave Explorer alone after a scaling change
 ```
 
 ## Commands
 
 | Command | What it does |
 |---|---|
+| (none) | Set up your screens now and show the card, whether or not they are duplicated |
 | `status` | Show your screens, their sizes, and whether auto-display is running |
 | `update` | Check for and install a newer release now |
 | `laptop left\|right\|below` | Move the laptop screen |
 | `swap` | Swap two monitors |
-| `apply` | Fix duplicated screens now |
+| `layout` | Apply the layout and scaling now, without the card |
+| `taskbar` | Restart Explorer if the taskbar is the wrong size |
 | `preview` | Show the card with example screens (`dual`, `single`, `done`, `error`), without changing anything |
 | `uninstall` | Stop it and remove it from sign-in |
 

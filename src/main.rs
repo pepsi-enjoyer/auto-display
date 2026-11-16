@@ -5,6 +5,7 @@ mod display;
 mod fix;
 mod install;
 mod log;
+mod shell;
 mod ui;
 mod update;
 mod watch;
@@ -17,15 +18,15 @@ const USAGE: &str = "\
 auto-display: when a docked laptop comes up in duplicate mode, switch to extend, make the external
 display primary with the laptop screen to its left, and set external displays to 150%.
 
-Usage: auto-display <command>
+Usage: auto-display [command]
 
+  (none)      Set up the displays now, with the on-screen card, duplicated or not
   install     Copy to %LOCALAPPDATA%\\auto-display, run at every sign-in, and start now
   uninstall   Stop it and remove the sign-in entry
   status      Show the connected displays and whether the watcher is running
   update      Check GitHub for a newer release and install it now
-  apply       Fix the displays now if they are duplicated, with the on-screen card
-  setup       Same as apply, without a console (what the watcher starts)
-  layout      Apply the layout and scaling now, even if not duplicated
+  layout      Apply the layout and scaling now, without the card
+  taskbar     Restart Explorer so the taskbar matches the scaling (closes folder windows)
   laptop left|right|below
               Move the laptop screen to that side of the external monitors
   swap        Swap the two external monitors
@@ -36,8 +37,8 @@ Usage: auto-display <command>
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = args.first().map(String::as_str).unwrap_or("watch");
-    if command != "watch" && command != "setup" {
+    let command = args.first().map(String::as_str).unwrap_or("");
+    if !matches!(command, "" | "setup" | "watch") {
         // Built as a GUI program so it never flashes a console at sign-in; borrow the caller's.
         unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
         println!();
@@ -57,13 +58,10 @@ fn main() {
             println!("auto-display {}", update::CURRENT);
             Ok(())
         }
-        "setup" => ui::run().map(|_| ()),
-        "apply" => ui::run().map(|fixed| {
-            if !fixed {
-                println!("Displays are not duplicated; nothing to do.");
-            }
-        }),
+        // "setup" is what watchers before 0.3 start; one may still be running across an update.
+        "" | "setup" => ui::run(),
         "layout" => fix::apply_layout().map(|_| ()),
+        "taskbar" => shell::restart_explorer(),
         "laptop" => match args.get(1).map(String::as_str) {
             Some("left") => fix::arrange(Some(display::Side::Left), false).map(|_| ()),
             Some("right") => fix::arrange(Some(display::Side::Right), false).map(|_| ()),

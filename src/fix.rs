@@ -2,7 +2,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use crate::display::{self, Side};
-use crate::{config, log};
+use crate::{config, log, shell};
 
 /// Headless fix, used when the on-screen card cannot start: if the displays are duplicated, extend,
 /// arrange and scale them.
@@ -17,11 +17,34 @@ pub fn if_duplicate() -> Result<bool, String> {
     Ok(true)
 }
 
+/// Headless setup, used when the on-screen card cannot start: extend if duplicated, then arrange
+/// and scale.
+pub fn setup() -> Result<(), String> {
+    if !if_duplicate()? {
+        apply_layout()?;
+    }
+    Ok(())
+}
+
 /// Arranges the screens and applies the configured scaling.
 pub fn apply_layout() -> Result<display::Arrangement, String> {
     let arrangement = arrange(None, false)?;
-    scale()?;
+    if scale()? {
+        refresh_taskbar();
+    }
     Ok(arrangement)
+}
+
+/// Restarts Explorer so the taskbar is redrawn at the new scaling, unless config.toml turns that
+/// off. A failure is logged and otherwise ignored: the displays themselves are already set up.
+pub fn refresh_taskbar() {
+    if !config::load().restart_explorer {
+        return;
+    }
+    match shell::restart_explorer() {
+        Ok(()) => log::line("Restarted Explorer so the taskbar matches the new scaling."),
+        Err(e) => log::line(&format!("error: {e}")),
+    }
 }
 
 /// Arranges the screens, putting the laptop on `laptop` if given and reversing the two monitors if
@@ -46,9 +69,10 @@ pub fn side_name(side: Side) -> &'static str {
     }
 }
 
-/// Applies the scaling from config.toml.
-pub fn scale() -> Result<(), String> {
+/// Applies the scaling from config.toml. Returns true if any screen's scaling changed.
+pub fn scale() -> Result<bool, String> {
     let config = config::load();
+    let mut changed = false;
     for (internal, percent, what) in [
         (false, config.external_scale, "external display(s)"),
         (true, config.laptop_scale, "laptop screen(s)"),
@@ -57,7 +81,8 @@ pub fn scale() -> Result<(), String> {
         let n = display::scale_screens(internal, percent)?;
         if n > 0 {
             log::line(&format!("Set {n} {what} to {percent}%."));
+            changed = true;
         }
     }
-    Ok(())
+    Ok(changed)
 }

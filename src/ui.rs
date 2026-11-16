@@ -1,6 +1,6 @@
-//! The on-screen card shown while auto-display fixes duplicated displays.
+//! The on-screen card shown while auto-display sets up the displays.
 //!
-//! Runs in its own short-lived process (`auto-display setup`) so the watcher stays a plain Win32
+//! Runs in its own short-lived process (`auto-display`) so the watcher stays a plain Win32
 //! message loop. A worker thread does the display changes and publishes progress; the card shows it
 //! on every monitor, then lets the user move the laptop screen (by clicking a faded "ghost" laptop)
 //! or swap two monitors, keeping the layout after 10 seconds.
@@ -38,10 +38,8 @@ const DONE_FOR: Duration = Duration::from_millis(2800);
 const FAILED_FOR: Duration = Duration::from_secs(10);
 const FADE_IN: f32 = 0.22;
 const FADE_OUT: f32 = 0.25;
-/// Time between frames. The card paces itself rather than waiting on vsync: with a window on every
-/// monitor, each window's vsync wait would add up and divide the frame rate by the monitor count.
-const FRAME: Duration = Duration::from_millis(8);
-
+const EXTENDING: &str = "Switching to extend";
+const ARRANGING: &str = "Arranging your screens";
 const BG: Color32 = Color32::from_rgb(0x1b, 0x1c, 0x1f);
 const SURFACE: Color32 = Color32::from_rgb(0x15, 0x16, 0x18);
 const SURFACE_EDGE: Color32 = Color32::from_rgb(0x2a, 0x2c, 0x30);
@@ -89,37 +87,44 @@ fn set_phase_with(state: &State, ctx: &egui::Context, phase: Phase, screens: Opt
     ctx.request_repaint();
 }
 
-/// Fixes duplicated displays with the card on screen. Returns false if they were not duplicated.
-pub fn run() -> Result<bool, String> {
+/// Sets up the displays with the card on screen: extends them if they are duplicated, then arranges
+/// and scales them and lets the user adjust the layout.
+pub fn run() -> Result<(), String> {
     let name = watch::wide("Local\\auto-display-setup");
     let mutex = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
     if !mutex.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        return Ok(true); // Another setup is already on it.
+        return Ok(()); // Another setup is already on it.
     }
-    if !display::is_duplicate(&display::active()?.paths) {
-        return Ok(false);
-    }
+    let duplicated = display::is_duplicate(&display::active()?.paths);
+    let first = if duplicated { EXTENDING } else { ARRANGING };
 
-    let started = show(display::screens().unwrap_or_default(), None, worker)?;
+    let started = show(display::screens().unwrap_or_default(), first, None, move |state, ctx| {
+        worker(state, ctx, duplicated)
+    })?;
     if !started {
-        fix::if_duplicate()?;
+        fix::setup()?;
     }
-    Ok(true)
+    Ok(())
 }
 
-fn worker(state: State, ctx: egui::Context) {
+fn worker(state: State, ctx: egui::Context, duplicated: bool) {
     // Let the card fade in before the screens start flickering.
     sleep(Duration::from_millis(500));
     let result = (|| -> Result<bool, String> {
-        log::line("Displays are duplicated; switching to extend.");
-        display::extend()?;
-        sleep(Duration::from_millis(1500));
-        set_phase(&state, &ctx, Phase::Working("Arranging your screens".into()));
-        sleep(Duration::from_millis(400));
+        if duplicated {
+            log::line("Displays are duplicated; switching to extend.");
+            display::extend()?;
+            sleep(Duration::from_millis(1500));
+            set_phase(&state, &ctx, Phase::Working(ARRANGING.into()));
+            sleep(Duration::from_millis(400));
+        }
         let arrangement = fix::arrange(None, false)?;
         set_phase(&state, &ctx, Phase::Working("Setting display scaling".into()));
         sleep(Duration::from_millis(400));
-        fix::scale()?;
+        if fix::scale()? {
+            set_phase(&state, &ctx, Phase::Working("Refreshing the taskbar".into()));
+            fix::refresh_taskbar();
+        }
         Ok(arrangement.has_choices())
     })();
     let phase = match result {
@@ -187,10 +192,10 @@ pub fn preview(kind: &str) -> Result<(), String> {
     let names = if preview.dual() { "Laptop + DELL U2723QE + LG 27UL850" } else { "Laptop + DELL U4021QW" };
     let start = vec![fake(names, false, true, 0, 0, 3840, 2400, (597.0, 336.0))];
     let worker_preview = preview.clone();
-    show(start, Some(preview), move |state, ctx| {
+    show(start, EXTENDING, Some(preview), move |state, ctx| {
         sleep(Duration::from_millis(1400));
         let arranged = worker_preview.screens();
-        set_phase_with(&state, &ctx, Phase::Working("Arranging your screens".into()), Some(arranged.clone()));
+        set_phase_with(&state, &ctx, Phase::Working(ARRANGING.into()), Some(arranged.clone()));
         sleep(Duration::from_millis(1000));
         set_phase_with(&state, &ctx, Phase::Working("Setting display scaling".into()), Some(arranged.clone()));
         sleep(Duration::from_millis(800));
@@ -207,14 +212,16 @@ pub fn preview(kind: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------------------------
 // The window(s).
 
-/// Shows the card and runs `work` alongside it. Returns false if the window never started.
+/// Shows the card, starting on the step `first`, and runs `work` alongside it. Returns false if the
+/// window never started.
 fn show(
     screens: Vec<Screen>,
+    first: &str,
     preview: Option<Preview>,
     work: impl FnOnce(State, egui::Context) + Send + 'static,
 ) -> Result<bool, String> {
     let state: State = Arc::new(Mutex::new(Shared {
-        phase: Phase::Working("Switching to extend".into()),
+        phase: Phase::Working(first.into()),
         since: Instant::now(),
         screens,
     }));
@@ -241,6 +248,8 @@ fn show(
     Ok(started.load(Ordering::SeqCst))
 }
 
+/// Vsync is off because every monitor has a card window and each window would wait for its own
+/// vsync, dividing the frame rate by the number of monitors. `wait_for_compositor` paces the frames.
 fn egui_glow_config() -> eframe::egui_glow::GlowConfiguration {
     let mut config = eframe::egui_glow::GlowConfiguration::default();
     config.vsync = false;
@@ -347,6 +356,22 @@ impl Card {
         }
     }
 
+    /// The id of the screen that card window number `monitor` sits on, which that card highlights.
+    fn screen_under(&self, screens: &[Screen], monitor: usize) -> Option<String> {
+        if self.preview.is_some() {
+            // Made-up screens: pair them with the real monitors in the same order, main display first.
+            let mut order: Vec<&Screen> = screens.iter().collect();
+            order.sort_by_key(|s| (!s.primary, s.x, s.y));
+            return order.get(monitor).map(|s| s.id.clone());
+        }
+        let work = self.monitors.get(monitor)?;
+        let (x, y) = ((work.left + work.right) / 2, (work.top + work.bottom) / 2);
+        screens
+            .iter()
+            .find(|s| x >= s.x && x < s.x + s.width && y >= s.y && y < s.y + s.height)
+            .map(|s| s.id.clone())
+    }
+
     fn close(&mut self) {
         self.closing.get_or_insert_with(Instant::now);
     }
@@ -426,7 +451,8 @@ impl eframe::App for Card {
             Phase::Prompt if since.elapsed() >= KEEP_AFTER && self.closing.is_none() => self.act(Action::Keep, ctx),
             _ => {}
         }
-        ctx.request_repaint_after(FRAME);
+        wait_for_compositor();
+        ctx.request_repaint();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -435,14 +461,18 @@ impl eframe::App for Card {
             (s.phase.clone(), s.since, s.screens.clone())
         };
         let ctx = ui.ctx().clone();
-        let mut action = draw(ui, &phase, since, &screens);
+        let here: Vec<Option<String>> =
+            (0..self.monitors.len().max(1)).map(|m| self.screen_under(&screens, m)).collect();
+        let mut action = draw(ui, &phase, since, &screens, here[0].as_deref());
 
         // The same card on every other monitor; any of them can be clicked.
         for monitor in 1..self.monitors.len() {
             let id = ViewportId::from_hash_of(("card", monitor));
             let title = format!("auto-display ({})", monitor + 1);
             let clicked =
-                ctx.show_viewport_immediate(id, card_viewport(&title), |ui, _| draw(ui, &phase, since, &screens));
+                ctx.show_viewport_immediate(id, card_viewport(&title), |ui, _| {
+                    draw(ui, &phase, since, &screens, here[monitor].as_deref())
+                });
             action = action.or(clicked);
             self.manage(&ctx, id, find_window(&title), monitor);
         }
@@ -484,7 +514,8 @@ fn choices(screens: &[Screen]) -> Choices {
     Choices { dual: display::is_dual(&externals), ghosts }
 }
 
-fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen]) -> Option<Action> {
+/// Draws the card. `here` is the id of the screen this card is on, which is highlighted.
+fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen], here: Option<&str>) -> Option<Action> {
     let rect = ui.max_rect();
     let painter = ui.painter().clone();
     let t = ui.input(|i| i.time) as f32;
@@ -513,7 +544,7 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen]) ->
     painter.rect_filled(area, CornerRadius::same(10), SURFACE);
     painter.rect_stroke(area, CornerRadius::same(10), Stroke::new(1.0, SURFACE_EDGE), StrokeKind::Inside);
     let ghosts = choices.as_ref().map_or(&[][..], |c| &c.ghosts[..]);
-    let mut action = draw_screens(ui, &painter, area.shrink2(vec2(22.0, 18.0)), screens, ghosts).map(Action::MoveLaptop);
+    let mut action = draw_screens(ui, &painter, area.shrink2(vec2(22.0, 18.0)), screens, ghosts, here).map(Action::MoveLaptop);
 
     // Footer.
     let row = Rect::from_min_max(pos2(rect.left() + PAD, rect.bottom() - 54.0), pos2(rect.right() - PAD, rect.bottom() - 20.0));
@@ -680,7 +711,14 @@ fn physical_layout(screens: &[Screen], ghosts: &[Screen]) -> (Vec<Rect>, Vec<Rec
 }
 
 /// Draws the screens to scale, plus clickable ghost laptops. Returns the side of a clicked ghost.
-fn draw_screens(ui: &egui::Ui, painter: &Painter, area: Rect, screens: &[Screen], ghosts: &[(Side, Screen)]) -> Option<Side> {
+fn draw_screens(
+    ui: &egui::Ui,
+    painter: &Painter,
+    area: Rect,
+    screens: &[Screen],
+    ghosts: &[(Side, Screen)],
+    here: Option<&str>,
+) -> Option<Side> {
     if screens.is_empty() {
         return None;
     }
@@ -711,18 +749,19 @@ fn draw_screens(ui: &egui::Ui, painter: &Painter, area: Rect, screens: &[Screen]
         }
     }
     for (s, r) in screens.iter().zip(&rects) {
-        draw_screen(painter, s, animate(&s.id, to_card(r)).shrink(2.0));
+        draw_screen(painter, s, animate(&s.id, to_card(r)).shrink(2.0), here == Some(s.id.as_str()));
     }
     clicked
 }
 
-fn draw_screen(painter: &Painter, s: &Screen, r: Rect) {
+/// Draws one screen. `here` highlights it as the screen this card is on.
+fn draw_screen(painter: &Painter, s: &Screen, r: Rect, here: bool) {
     let radius = CornerRadius::same(5);
     painter.rect_filled(r, radius, SCREEN);
-    if s.primary {
+    if here {
         painter.rect_filled(r, radius, ACCENT.gamma_multiply(0.14));
     }
-    let edge = if s.primary { Stroke::new(1.5, ACCENT) } else { Stroke::new(1.0, SCREEN_EDGE) };
+    let edge = if here { Stroke::new(1.5, ACCENT) } else { Stroke::new(1.0, SCREEN_EDGE) };
     painter.rect_stroke(r, radius, edge, StrokeKind::Inside);
     if s.internal {
         // The laptop's keyboard deck.
@@ -734,20 +773,20 @@ fn draw_screen(painter: &Painter, s: &Screen, r: Rect) {
     let name = label(painter, &s.name, &name_font, r.width() - 12.0);
     let inches = s.mm.map(|(w, h)| (w * w + h * h).sqrt() / 25.4).filter(|d| *d > 5.0 && !s.name.contains(" + "));
     let detail = match (s.primary, inches) {
-        (true, Some(d)) => Some((format!("Main display · {d:.0}\""), ACCENT_TEXT)),
-        (true, None) => Some(("Main display".to_string(), ACCENT_TEXT)),
+        (true, Some(d)) => Some((format!("Main display · {d:.0}\""), if here { ACCENT_TEXT } else { MUTED })),
+        (true, None) => Some(("Main display".to_string(), if here { ACCENT_TEXT } else { MUTED })),
         (false, Some(d)) => Some((format!("{d:.0}\""), MUTED)),
         (false, None) => None,
     };
     match detail {
         Some((text, colour)) if r.height() > 40.0 => {
-            painter.text(r.center() - vec2(0.0, 8.0), Align2::CENTER_CENTER, name, name_font, if s.primary { TEXT } else { MUTED });
+            painter.text(r.center() - vec2(0.0, 8.0), Align2::CENTER_CENTER, name, name_font, if here { TEXT } else { MUTED });
             let detail_font = semibold(11.0);
             let text = fit(painter, &text, &detail_font, r.width() - 12.0);
             painter.text(r.center() + vec2(0.0, 9.0), Align2::CENTER_CENTER, text, detail_font, colour);
         }
         _ => {
-            painter.text(r.center(), Align2::CENTER_CENTER, name, name_font, if s.primary { TEXT } else { MUTED });
+            painter.text(r.center(), Align2::CENTER_CENTER, name, name_font, if here { TEXT } else { MUTED });
         }
     }
 }
@@ -844,6 +883,19 @@ fn style_window(h: isize) {
         DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, (&DWMWCP_ROUND as *const u32).cast(), 4);
         DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR, (&border as *const u32).cast(), 4);
         DwmSetWindowAttribute(h, DWMWA_CAPTION_COLOR, (&caption as *const u32).cast(), 4);
+    }
+}
+
+/// Blocks until Windows next composes the desktop, so the card draws once per screen refresh however
+/// many windows it has. (egui's own repaint delay cannot do this: it subtracts a frame's duration,
+/// which turns any delay of a frame or less into "repaint immediately".)
+fn wait_for_compositor() {
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmFlush() -> i32;
+    }
+    if unsafe { DwmFlush() } < 0 {
+        sleep(Duration::from_millis(16));
     }
 }
 
@@ -989,7 +1041,7 @@ mod tests {
             let isolated = egui::Context::default();
             install_fonts(&isolated);
             let output = paint_frame(&isolated, viewport, size, 0.0, |ui| {
-                draw(ui, &Phase::Prompt, Instant::now(), &screens);
+                draw(ui, &Phase::Prompt, Instant::now(), &screens, None);
             });
             let rects = screen_rects(&output);
             assert_eq!(rects.len(), screens.len());
@@ -998,7 +1050,7 @@ mod tests {
         for frame in 0..120 {
             for (i, (viewport, size)) in viewports.into_iter().enumerate() {
                 let output = paint_frame(&ctx, viewport, size, frame as f64 / 60.0, |ui| {
-                    draw(ui, &Phase::Prompt, Instant::now(), &screens);
+                    draw(ui, &Phase::Prompt, Instant::now(), &screens, None);
                 });
                 assert_eq!(screen_rects(&output), expected[i], "frame {frame}, monitor {i}");
             }
