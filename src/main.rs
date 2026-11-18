@@ -21,8 +21,9 @@ display primary with the laptop screen to its left, and set external displays to
 Usage: auto-display [command]
 
   (none)      Set up the displays now, with the on-screen card, duplicated or not
-  install     Copy to %LOCALAPPDATA%\\auto-display, run at every sign-in, and start now
-  uninstall   Stop it and remove the sign-in entry
+  install     Install to %LOCALAPPDATA%\\auto-display, add it to your user PATH, and start
+              the watcher now and at sign-in
+  uninstall   Stop it and remove it from sign-in and your user PATH
   status      Show the connected displays and whether the watcher is running
   update      Check GitHub for a newer release and install it now
   layout      Apply the layout and scaling now, without the card

@@ -35,7 +35,11 @@
         if ($installer.ExitCode -ne 0) {
             throw "Installation failed (exit $($installer.ExitCode)). See %LOCALAPPDATA%\auto-display\auto-display.log."
         }
-        Write-Host "Installed to $env:LOCALAPPDATA\auto-display. Running now and at every sign-in."
+        $installDir = Join-Path $env:LOCALAPPDATA 'auto-display'
+        if (($env:Path -split ';' -replace '[\\/]+$', '') -notcontains $installDir) {
+            $env:Path = if ($env:Path) { "$env:Path;$installDir" } else { $installDir }
+        }
+        Write-Host "Installed to $installDir. Running now and at every sign-in."
     }
     finally {
         Remove-Item -LiteralPath $exe, $checksums -Force -ErrorAction SilentlyContinue

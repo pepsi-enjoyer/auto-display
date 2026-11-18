@@ -37,12 +37,13 @@ irm https://raw.githubusercontent.com/pepsi-enjoyer/auto-display/master/install.
 ```
 
 This downloads the [latest release](https://github.com/pepsi-enjoyer/auto-display/releases/latest),
-checks its SHA-256 checksum, and installs it to `%LOCALAPPDATA%\auto-display`. It starts now and at
-every sign-in. No Rust or admin rights are needed. Run the same command again to update; your
-settings are kept. Once installed, it checks for updates after one minute and every six hours,
-verifies the download, and restarts itself without changing your current display layout.
+checks its SHA-256 checksum, installs it to `%LOCALAPPDATA%\auto-display`, and adds it to your user
+PATH. It starts now and at every sign-in. No Rust or admin rights are needed. Run the same command
+again to update; your settings are kept. Once installed, it checks for updates after one minute and
+every six hours, verifies the download, and restarts itself without changing your current display layout.
 
-You can also download `auto-display.exe` from the release and run `.\auto-display.exe install`.
+You can also download `auto-display.exe` from the release and run `.\auto-display.exe install`,
+then reopen PowerShell to pick up the PATH change.
 
 Or build and install with [Rust](https://rustup.rs):
 
@@ -56,11 +57,10 @@ auto-display install
 Once installed, you can set up your screens and bring up the card whenever you like:
 
 ```powershell
-& "$env:LOCALAPPDATA\auto-display\auto-display.exe"
+auto-display
 ```
 
-That is `auto-display` with no command. The same path works for the commands below if
-`auto-display` is not on your PATH.
+If you installed an older version, rerun the installer once to add it to your PATH.
 
 ## Settings
 
@@ -86,6 +86,6 @@ restart_explorer = true   # set to false to leave Explorer alone after a scaling
 | `layout` | Apply the layout and scaling now, without the card |
 | `taskbar` | Restart Explorer if the taskbar is the wrong size |
 | `preview` | Show the card with example screens (`dual`, `single`, `done`, `error`), without changing anything |
-| `uninstall` | Stop it and remove it from sign-in |
+| `uninstall` | Stop it and remove it from sign-in and your user PATH |
 
 The log is at `%LOCALAPPDATA%\auto-display\auto-display.log`.

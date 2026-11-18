@@ -38,19 +38,34 @@ function Start-Process {
 
 $cases = @(
     @{ Name = 'success'; Error = $null; Launches = 1 },
+    @{ Name = 'reinstall'; Error = $null; Launches = 1 },
     @{ Name = 'wrong checksum'; Error = '*download checksum does not match*'; Launches = 0 },
     @{ Name = 'invalid checksum'; Error = '*checksum file is invalid*'; Launches = 0 },
     @{ Name = 'download failure'; Error = '*Simulated download failure*'; Launches = 0 },
     @{ Name = 'install failure'; Error = '*Installation failed (exit 1)*'; Launches = 1 }
 )
 
+$installDir = Join-Path $env:LOCALAPPDATA 'auto-display'
 foreach ($case in $cases) {
     $script:scenario = $case.Name
     $script:downloadDir = $null
     $script:launchCount = 0
     $script:waitCount = 0
     $failure = $null
-    try { . $installerScript } catch { $failure = $_.Exception.Message }
+    $previousPath = $env:Path
+    $initialPath = 'C:\Existing\bin;C:\Program Files\Other Tool'
+    if ($case.Name -eq 'reinstall') {
+        $initialPath += ";$installDir\"
+    }
+    $env:Path = $initialPath
+    try { . $installerScript } catch { $failure = $_.Exception.Message } finally {
+        $actualPath = $env:Path
+        $env:Path = $previousPath
+    }
+    $expectedPath = if ($case.Error -or $case.Name -eq 'reinstall') { $initialPath } else { "$initialPath;$installDir" }
+    if ($actualPath -cne $expectedPath) {
+        throw "$($case.Name): expected PATH '$expectedPath', got '$actualPath'"
+    }
     if ($case.Error) {
         if ($failure -notlike $case.Error) {
             throw "$($case.Name): expected '$($case.Error)', got '$failure'"
