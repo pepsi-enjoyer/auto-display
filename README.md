@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/icon.svg" alt="auto-display icon" width="72" height="72">
+  <img src="docs/icon.svg" alt="auto-display icon" width="84" height="84">
   <h1>auto-display</h1>
   <p><strong>Stop Windows laptops from duplicating screens when you dock.</strong><br>
   Automatically switches to extend, restores your layout and DPI scaling, and gives you a to-scale preview card.</p>
