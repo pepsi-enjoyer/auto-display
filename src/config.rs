@@ -12,7 +12,9 @@ use crate::log;
 const DEFAULT: &str = "\
 # auto-display settings. Changes apply the next time it sets up your displays.
 
-# Scaling for external monitors, in percent: 100, 125, 150, 175, 200, 225, 250, 300, ...
+# Scaling for a 4K external monitor, in percent.
+# Other external resolutions use the closest supported scale in proportion to their shorter side.
+# For example, 150% on 4K gives 100% on both 1440p and 1080p.
 external_scale = 150
 
 # Scaling for the laptop screen. Leave commented out to keep what Windows chose.

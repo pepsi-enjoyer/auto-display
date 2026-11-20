@@ -2,8 +2,7 @@
 //!
 //! Runs in its own short-lived process (`auto-display`) so the watcher stays a plain Win32
 //! message loop. A worker thread does the display changes and publishes progress; the card shows it
-//! on every monitor, then lets the user move the laptop screen (by clicking a faded "ghost" laptop)
-//! or swap two monitors, keeping the layout after 10 seconds.
+//! on every monitor, then lets the user adjust the displays and choose whether to keep the changes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,30 +18,39 @@ use eframe::egui::{
     vec2,
 };
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, RECT};
-use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, LWA_ALPHA, MONITORINFOF_PRIMARY,
-    SWP_NOACTIVATE, SWP_NOSIZE, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, WS_EX_LAYERED,
+    FindWindowExW, FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    LWA_ALPHA, MONITORINFOF_PRIMARY, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, WS_EX_LAYERED,
 };
 use windows_sys::core::BOOL;
 
-use crate::display::{self, Area, SIDES, Screen, Side};
-use crate::{fix, log, watch};
+use crate::display::{self, Area, Rotation, Screen, Side, Snapshot};
+use crate::{config, fix, install, log, watch};
 
-const WIDTH: f32 = 540.0;
-const HEIGHT: f32 = 372.0;
-const PAD: f32 = 28.0;
+mod diagram;
+mod pointer;
+use diagram::{corner_rect, offset_in_mm, offset_in_pixels, physical_rects};
+use pointer::{PointerAnchor, PointerSettlement};
+
+const WIDTH: f32 = 584.0;
+const HEIGHT: f32 = 414.0;
+const PAD: f32 = 24.0;
 const KEEP_AFTER: Duration = Duration::from_secs(10);
-const DONE_FOR: Duration = Duration::from_millis(2800);
+const DONE_FOR: Duration = Duration::from_secs(3);
 const FAILED_FOR: Duration = Duration::from_secs(10);
 const FADE_IN: f32 = 0.22;
 const FADE_OUT: f32 = 0.25;
-const EXTENDING: &str = "Switching to extend";
-const ARRANGING: &str = "Arranging your screens";
+const CARD_ALPHA: f32 = 234.0;
+const MONITOR_POLL: Duration = Duration::from_millis(250);
+const ANIMATION_TICK: Duration = Duration::from_millis(33);
+const COUNTDOWN_TICK: Duration = Duration::from_millis(75);
+const SNAP_DISTANCE: f32 = 10.0;
+const MIN_SEAM: f32 = 8.0;
 const BG: Color32 = Color32::from_rgb(0x1b, 0x1c, 0x1f);
 const SURFACE: Color32 = Color32::from_rgb(0x15, 0x16, 0x18);
-const SURFACE_EDGE: Color32 = Color32::from_rgb(0x2a, 0x2c, 0x30);
 const SCREEN: Color32 = Color32::from_rgb(0x2d, 0x30, 0x36);
 const SCREEN_EDGE: Color32 = Color32::from_rgb(0x47, 0x4a, 0x52);
 const BUTTON: Color32 = Color32::from_rgb(0x2b, 0x2d, 0x32);
@@ -58,8 +66,10 @@ const BAD: Color32 = Color32::from_rgb(0xf0, 0x6a, 0x6a);
 
 #[derive(Clone, PartialEq)]
 enum Phase {
-    Working(String),
+    Working,
     Prompt,
+    Applying,
+    Kept,
     Done(String),
     Failed(String),
 }
@@ -68,12 +78,22 @@ struct Shared {
     phase: Phase,
     since: Instant,
     screens: Vec<Screen>,
+    needs_taskbar_refresh: bool,
+    pointer_settlement: Option<PointerSettlement>,
 }
 
 type State = Arc<Mutex<Shared>>;
 
-fn set_phase(state: &State, ctx: &egui::Context, phase: Phase) {
-    set_phase_with(state, ctx, phase, display::screens().ok());
+fn capture_pointer(state: &State) -> Option<PointerAnchor> {
+    PointerAnchor::capture(&state.lock().unwrap().screens)
+}
+
+fn finish_display_change(state: &State, ctx: &egui::Context, phase: Phase, pointer: Option<PointerAnchor>) {
+    let actual = display::screens().ok();
+    if let (Some(pointer), Some(screens)) = (pointer, actual.as_ref()) {
+        pointer.restore(screens);
+    }
+    set_phase_with(state, ctx, phase, actual);
 }
 
 fn set_phase_with(state: &State, ctx: &egui::Context, phase: Phase, screens: Option<Vec<Screen>>) {
@@ -84,21 +104,19 @@ fn set_phase_with(state: &State, ctx: &egui::Context, phase: Phase, screens: Opt
         s.screens = screens;
     }
     drop(s);
-    ctx.request_repaint();
+    ctx.request_repaint_of(ViewportId::ROOT);
 }
 
-/// Sets up the displays with the card on screen: extends them if they are duplicated, then arranges
-/// and scales them and lets the user adjust the layout.
+/// Opens the card with the Windows layout for the connected displays.
 pub fn run() -> Result<(), String> {
     let name = watch::wide("Local\\auto-display-setup");
     let mutex = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
     if !mutex.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         return Ok(()); // Another setup is already on it.
     }
-    let duplicated = display::is_duplicate(&display::active()?.paths);
-    let first = if duplicated { EXTENDING } else { ARRANGING };
-
-    let started = show(display::screens().unwrap_or_default(), first, None, move |state, ctx| {
+    let snapshot = Snapshot::capture()?;
+    let duplicated = snapshot.duplicated();
+    let started = show(snapshot.screens(), None, Some(snapshot), move |state, ctx| {
         worker(state, ctx, duplicated)
     })?;
     if !started {
@@ -108,40 +126,55 @@ pub fn run() -> Result<(), String> {
 }
 
 fn worker(state: State, ctx: egui::Context, duplicated: bool) {
-    // Let the card fade in before the screens start flickering.
-    sleep(Duration::from_millis(500));
-    let result = (|| -> Result<bool, String> {
+    let result = (|| -> Result<(), String> {
         if duplicated {
             log::line("Displays are duplicated; switching to extend.");
-            display::extend()?;
-            sleep(Duration::from_millis(1500));
-            set_phase(&state, &ctx, Phase::Working(ARRANGING.into()));
-            sleep(Duration::from_millis(400));
+            let pointer = capture_pointer(&state);
+            let result = display::extend();
+            finish_display_change(&state, &ctx, Phase::Working, pointer);
+            result?;
         }
-        let arrangement = fix::arrange(None, false)?;
-        set_phase(&state, &ctx, Phase::Working("Setting display scaling".into()));
-        sleep(Duration::from_millis(400));
-        if fix::scale()? {
-            set_phase(&state, &ctx, Phase::Working("Refreshing the taskbar".into()));
-            fix::refresh_taskbar();
+        let layout = {
+            let screens = state.lock().unwrap().screens.clone();
+            display::remembered_layout(&screens)
+        };
+        match layout {
+            display::StartupLayout::Current => {}
+            display::StartupLayout::Remembered => {
+                let pointer = capture_pointer(&state);
+                let result = display::restore_remembered_layout();
+                finish_display_change(&state, &ctx, Phase::Working, pointer);
+                result?;
+                log::line("Restored the Windows layout for these displays.");
+            }
+            display::StartupLayout::Defaults => {
+                let pointer = capture_pointer(&state);
+                let result = fix::arrange(None, false);
+                finish_display_change(&state, &ctx, Phase::Working, pointer);
+                result?;
+                let pointer = capture_pointer(&state);
+                let scaling = fix::scale();
+                finish_display_change(&state, &ctx, Phase::Working, pointer);
+                if scaling? {
+                    fix::refresh_taskbar();
+                }
+            }
         }
-        Ok(arrangement.has_choices())
+        Ok(())
     })();
     let phase = match result {
-        Ok(true) => Phase::Prompt,
-        Ok(false) => {
-            let main = display::screens().ok().and_then(|s| s.into_iter().find(|s| s.primary)).map(|s| s.name);
-            Phase::Done(match main {
-                Some(name) => format!("{name} is your main display."),
-                None => "Your displays are extended.".into(),
-            })
-        }
+        Ok(()) if !state.lock().unwrap().screens.is_empty() => Phase::Prompt,
+        Ok(()) => Phase::Done("Your displays are extended.".into()),
         Err(e) => {
             log::line(&format!("error: {e}"));
             Phase::Failed(e)
         }
     };
-    set_phase(&state, &ctx, phase);
+    let ready = phase == Phase::Prompt;
+    set_phase_with(&state, &ctx, phase, None);
+    if ready {
+        log::line("Display preview is ready.");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -150,8 +183,6 @@ fn worker(state: State, ctx: egui::Context, duplicated: bool) {
 #[derive(Clone)]
 struct Preview {
     kind: String,
-    laptop: Side,
-    swapped: bool,
 }
 
 impl Preview {
@@ -161,44 +192,43 @@ impl Preview {
 
     fn screens(&self) -> Vec<Screen> {
         let mut screens = if self.dual() {
-            let dell = ("DELL U2723QE", (597.0, 336.0));
-            let lg = ("LG 27UL850", (597.0, 336.0));
-            let (left, right) = if self.swapped { (lg, dell) } else { (dell, lg) };
+            let (w, h) = if self.kind == "portrait" { (2160, 3840) } else { (3840, 2160) };
             vec![
-                fake(left.0, false, false, -3840, 0, 3840, 2160, left.1),
-                fake(right.0, false, true, 0, 0, 3840, 2160, right.1),
+                fake("DELL U2723QE", false, false, (-w, 0, w, h), (597.0, 336.0)),
+                fake("LG 27UL850", false, true, (0, 0, 3840, 2160), (597.0, 336.0)),
             ]
         } else {
-            vec![fake("DELL U4021QW", false, true, 0, 0, 5120, 2160, (977.0, 412.0))]
+            vec![fake("DELL U4021QW", false, true, (0, 0, 5120, 2160), (977.0, 412.0))]
         };
         let areas: Vec<Area> = screens.iter().map(Screen::area).collect();
-        let (x, y) = display::laptop_spot(&areas, (3840, 2400), self.laptop);
-        screens.push(fake("Laptop", true, false, x, y, 3840, 2400, (345.0, 215.0)));
+        let side = if self.dual() { Side::Below } else { Side::Left };
+        let (x, y) = display::laptop_spot(&areas, (3840, 2400), side);
+        screens.push(fake("Laptop", true, false, (x, y, 3840, 2400), (345.0, 215.0)));
         screens
     }
 }
 
-fn fake(name: &str, internal: bool, primary: bool, x: i32, y: i32, width: i32, height: i32, mm: (f32, f32)) -> Screen {
-    Screen { id: name.into(), name: name.into(), internal, primary, x, y, width, height, mm: Some(mm) }
+fn fake(name: &str, internal: bool, primary: bool, area: (i32, i32, i32, i32), mm: (f32, f32)) -> Screen {
+    let (x, y, width, height) = area;
+    Screen {
+        id: name.into(), name: name.into(), internal, primary, x, y, width, height, mm: Some(mm),
+        rotation: if width < height { Rotation::Portrait } else { Rotation::Landscape },
+        scale: Some(display::Scale::sample(if internal { 250 } else { 150 })),
+    }
 }
 
 /// Plays the card with made-up screens and changes nothing. `kind` is "dual" (two monitors),
-/// "single" (one ultrawide), "done" (nothing to ask) or "error".
+/// "portrait" (one monitor turned vertically), "single" (one ultrawide), "done" or "error".
 pub fn preview(kind: &str) -> Result<(), String> {
-    let mut preview = Preview { kind: kind.to_owned(), laptop: Side::Left, swapped: false };
-    if preview.dual() {
-        preview.laptop = Side::Below;
-    }
+    let preview = Preview { kind: kind.to_owned() };
     let names = if preview.dual() { "Laptop + DELL U2723QE + LG 27UL850" } else { "Laptop + DELL U4021QW" };
-    let start = vec![fake(names, false, true, 0, 0, 3840, 2400, (597.0, 336.0))];
+    let start = vec![fake(names, false, true, (0, 0, 3840, 2400), (597.0, 336.0))];
     let worker_preview = preview.clone();
-    show(start, EXTENDING, Some(preview), move |state, ctx| {
+    show(start, Some(preview), None, move |state, ctx| {
         sleep(Duration::from_millis(1400));
         let arranged = worker_preview.screens();
-        set_phase_with(&state, &ctx, Phase::Working(ARRANGING.into()), Some(arranged.clone()));
-        sleep(Duration::from_millis(1000));
-        set_phase_with(&state, &ctx, Phase::Working("Setting display scaling".into()), Some(arranged.clone()));
-        sleep(Duration::from_millis(800));
+        set_phase_with(&state, &ctx, Phase::Working, Some(arranged.clone()));
+        sleep(Duration::from_millis(1800));
         let last = match worker_preview.kind.as_str() {
             "error" => Phase::Failed("SetDisplayConfig (arrange) failed with error 87".into()),
             "done" => Phase::Done("DELL U4021QW is your main display.".into()),
@@ -212,18 +242,19 @@ pub fn preview(kind: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------------------------
 // The window(s).
 
-/// Shows the card, starting on the step `first`, and runs `work` alongside it. Returns false if the
-/// window never started.
+/// Shows the card and runs `work` alongside it. Returns false if the window never started.
 fn show(
     screens: Vec<Screen>,
-    first: &str,
     preview: Option<Preview>,
+    snapshot: Option<Snapshot>,
     work: impl FnOnce(State, egui::Context) + Send + 'static,
 ) -> Result<bool, String> {
     let state: State = Arc::new(Mutex::new(Shared {
-        phase: Phase::Working(first.into()),
+        phase: Phase::Working,
         since: Instant::now(),
         screens,
+        needs_taskbar_refresh: false,
+        pointer_settlement: None,
     }));
     let started = Arc::new(AtomicBool::new(false));
     let options = eframe::NativeOptions { viewport: card_viewport("auto-display").with_app_id("auto-display"),
@@ -235,11 +266,12 @@ fn show(
         "auto-display",
         options,
         Box::new(move |cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
             install_fonts(&cc.egui_ctx);
             app_started.store(true, Ordering::SeqCst);
             let (worker_state, ctx) = (app_state.clone(), cc.egui_ctx.clone());
             spawn(move || work(worker_state, ctx));
-            Ok(Box::new(Card::new(app_state, preview)))
+            Ok(Box::new(Card::new(app_state, preview, snapshot)))
         }),
     );
     if let Err(e) = result {
@@ -248,12 +280,10 @@ fn show(
     Ok(started.load(Ordering::SeqCst))
 }
 
-/// Vsync is off because every monitor has a card window and each window would wait for its own
-/// vsync, dividing the frame rate by the number of monitors. `wait_for_compositor` paces the frames.
+/// Each immediate viewport presents on the UI thread. Waiting on each one would make input wait
+/// for several display refreshes. Events and repaint timers schedule the frames instead.
 fn egui_glow_config() -> eframe::egui_glow::GlowConfiguration {
-    let mut config = eframe::egui_glow::GlowConfiguration::default();
-    config.vsync = false;
-    config
+    eframe::egui_glow::GlowConfiguration { vsync: false, ..Default::default() }
 }
 
 fn card_viewport(title: &str) -> ViewportBuilder {
@@ -298,9 +328,32 @@ fn regular(size: f32) -> FontId {
 
 enum Action {
     Keep,
+    Revert,
     Close,
-    MoveLaptop(Side),
-    SwapMonitors,
+    MoveScreen(usize, i32, i32),
+    SetScale(usize, u32),
+    SetMain(usize),
+}
+
+#[derive(Default)]
+struct LayoutEdit {
+    drag: Option<Drag>,
+    hold_open: bool,
+}
+
+impl LayoutEdit {
+    fn auto_keep(&self) -> bool {
+        !self.hold_open && self.drag.is_none()
+    }
+}
+
+struct Drag {
+    viewport: ViewportId,
+    screen: usize,
+    start: Pos2,
+    rect: Rect,
+    scale: f32,
+    origin_mm: Pos2,
 }
 
 /// One native window showing the card. The main one is eframe's root window; every other monitor
@@ -316,41 +369,51 @@ struct Card {
     state: State,
     shown: Option<Instant>,
     closing: Option<Instant>,
-    /// Work areas of the desktop monitors, main display first.
-    monitors: Vec<RECT>,
+    /// Monitors in card order. The first screen keeps the root window when desktop origins change.
+    monitors: Vec<DesktopMonitor>,
+    last_monitor_poll: Option<Instant>,
+    recenter: bool,
     /// Opacity for this frame, shared by every window.
     alpha: u8,
     windows: HashMap<ViewportId, CardWindow>,
     preview: Option<Preview>,
+    snapshot: Option<Arc<Snapshot>>,
+    mock_original: Option<Vec<Screen>>,
+    draft: Option<Vec<Screen>>,
+    edit: LayoutEdit,
 }
 
 impl Card {
-    fn new(state: State, preview: Option<Preview>) -> Self {
-        Card { state, shown: None, closing: None, monitors: Vec::new(), alpha: 0, windows: HashMap::new(), preview }
+    fn new(state: State, preview: Option<Preview>, snapshot: Option<Snapshot>) -> Self {
+        let edit = LayoutEdit { hold_open: preview.is_some(), ..Default::default() };
+        let mock_original = preview.as_ref().map(|_| state.lock().unwrap().screens.clone());
+        Card {
+            state, shown: None, closing: None, monitors: Vec::new(), last_monitor_poll: None,
+            recenter: false, alpha: 0, windows: HashMap::new(),
+            preview, snapshot: snapshot.map(Arc::new), mock_original, draft: None, edit,
+        }
     }
 
     /// Styles, fades and centres one card window on its monitor, and shows it once it is ready.
     fn manage(&mut self, ctx: &egui::Context, id: ViewportId, hwnd: Option<isize>, monitor: usize) {
         let alpha = self.alpha;
-        let work = self.monitors.get(monitor).copied();
+        let work = self.monitors.get(monitor).map(|m| m.work);
         let win = self.windows.entry(id).or_default();
-        if win.hwnd.is_none() {
-            win.hwnd = hwnd;
-            if let Some(h) = hwnd {
-                style_window(h);
-                set_alpha(h, 0);
-                win.alpha = Some(0);
-            }
+        if let Some(h) = hwnd.filter(|&h| win.hwnd != Some(h)) {
+            *win = CardWindow { hwnd: Some(h), ..Default::default() };
+            style_window(h);
+            set_alpha(h, 0);
+            win.alpha = Some(0);
         }
         let Some(h) = win.hwnd else { return };
-        if let Some(work) = work {
+        if (self.recenter || !win.shown) && let Some(work) = work {
             centre_in(h, work);
         }
         if !win.shown {
             ctx.send_viewport_cmd_to(id, ViewportCommand::Visible(true));
             win.shown = true;
         }
-        if win.alpha != Some(alpha) {
+        if win.alpha != Some(alpha) || (self.recenter && !is_layered(h)) {
             set_alpha(h, alpha);
             win.alpha = Some(alpha);
         }
@@ -364,8 +427,8 @@ impl Card {
             order.sort_by_key(|s| (!s.primary, s.x, s.y));
             return order.get(monitor).map(|s| s.id.clone());
         }
-        let work = self.monitors.get(monitor)?;
-        let (x, y) = ((work.left + work.right) / 2, (work.top + work.bottom) / 2);
+        let desktop = self.monitors.get(monitor)?.desktop;
+        let (x, y) = ((desktop.left + desktop.right) / 2, (desktop.top + desktop.bottom) / 2);
         screens
             .iter()
             .find(|s| x >= s.x && x < s.x + s.width && y >= s.y && y < s.y + s.height)
@@ -377,43 +440,162 @@ impl Card {
     }
 
     fn act(&mut self, action: Action, ctx: &egui::Context) {
-        let (working, laptop, swap) = match action {
-            Action::Keep => {
-                if self.preview.is_none() {
-                    log::line("Kept the layout.");
-                }
-                return self.close();
-            }
-            Action::Close => return self.close(),
-            Action::MoveLaptop(side) => ("Moving your laptop screen", Some(side), false),
-            Action::SwapMonitors => ("Swapping your monitors", None, true),
-        };
-        let (state, ctx) = (self.state.clone(), ctx.clone());
-        if let Some(preview) = &mut self.preview {
-            if let Some(side) = laptop {
-                preview.laptop = side;
-            }
-            preview.swapped ^= swap;
-            let current = state.lock().unwrap().screens.clone();
-            set_phase_with(&state, &ctx, Phase::Working(working.into()), Some(current));
-            let screens = preview.screens();
-            spawn(move || {
-                sleep(Duration::from_millis(600));
-                set_phase_with(&state, &ctx, Phase::Prompt, Some(screens));
-            });
+        if self.state.lock().unwrap().phase == Phase::Applying {
             return;
         }
-        set_phase(&state, &ctx, Phase::Working(working.into()));
+        match action {
+            Action::Keep => self.keep(ctx),
+            Action::Revert => self.revert(ctx),
+            Action::Close => self.close(),
+            Action::SetScale(index, percent) => self.change_scale(index, percent, ctx),
+            Action::MoveScreen(..) | Action::SetMain(..) => {
+                self.edit_layout(action);
+                ctx.request_repaint_of(ViewportId::ROOT);
+            }
+        }
+    }
+
+    fn keep(&mut self, ctx: &egui::Context) {
+        let (before, needs_refresh) = {
+            let state = self.state.lock().unwrap();
+            (state.screens.clone(), state.needs_taskbar_refresh)
+        };
+        let Some(mut screens) = self.draft.clone() else {
+            if self.preview.is_none() {
+                log::line("Kept the display settings.");
+                if needs_refresh {
+                    refresh_taskbar_detached();
+                }
+            }
+            set_phase_with(&self.state, ctx, Phase::Kept, None);
+            return;
+        };
+        for (draft, live) in screens.iter_mut().zip(&before) {
+            draft.scale = live.scale;
+        }
+        if self.preview.is_some() {
+            set_phase_with(&self.state, ctx, Phase::Kept, Some(screens));
+            return;
+        }
+
+        let (state, ctx) = (self.state.clone(), ctx.clone());
+        set_phase_with(&state, &ctx, Phase::Applying, None);
         spawn(move || {
-            let phase = match fix::arrange(laptop, swap) {
-                Ok(_) => Phase::Prompt,
-                Err(e) => {
-                    log::line(&format!("error: {e}"));
-                    Phase::Failed(e)
+            let pointer = PointerAnchor::capture(&before);
+            match display::apply_positions(&before, &screens) {
+                Ok(()) => {
+                    state.lock().unwrap().pointer_settlement = pointer.and_then(|anchor| anchor.restore_now(&screens));
+                    log::line("Kept the display layout.");
+                    if needs_refresh {
+                        refresh_taskbar_detached();
+                    }
+                    set_phase_with(&state, &ctx, Phase::Kept, Some(screens));
+                }
+                Err(error) => {
+                    log::line(&format!("error: {error}"));
+                    finish_display_change(&state, &ctx, Phase::Failed(error), pointer);
+                }
+            }
+        });
+    }
+
+    fn revert(&mut self, ctx: &egui::Context) {
+        self.draft = None;
+        let restored = Phase::Done("Previous display settings restored.".into());
+        if let Some(screens) = self.mock_original.take() {
+            set_phase_with(&self.state, ctx, restored, Some(screens));
+            return;
+        }
+        let Some(snapshot) = self.snapshot.clone() else { return self.close() };
+        let (state, ctx) = (self.state.clone(), ctx.clone());
+        let needs_refresh = state.lock().unwrap().needs_taskbar_refresh;
+        set_phase_with(&state, &ctx, Phase::Applying, None);
+        spawn(move || {
+            let pointer = capture_pointer(&state);
+            let phase = match snapshot.restore() {
+                Ok(scaling_changed) => {
+                    if scaling_changed || needs_refresh {
+                        refresh_taskbar_detached();
+                    }
+                    log::line("Restored the previous display settings.");
+                    restored
+                }
+                Err(error) => {
+                    log::line(&format!("error: {error}"));
+                    Phase::Failed(error)
                 }
             };
-            set_phase(&state, &ctx, phase);
+            finish_display_change(&state, &ctx, phase, pointer);
         });
+    }
+
+    fn edit_layout(&mut self, action: Action) {
+        self.edit.hold_open = true;
+        let state = self.state.lock().unwrap();
+        let mut screens = self.draft.as_deref().unwrap_or(&state.screens).to_vec();
+        match action {
+            Action::MoveScreen(index, x, y) => {
+                (screens[index].x, screens[index].y) = (x, y);
+            }
+            Action::SetMain(index) => {
+                for (i, screen) in screens.iter_mut().enumerate() {
+                    screen.primary = i == index;
+                }
+            }
+            _ => unreachable!(),
+        }
+        anchor_primary(&mut screens);
+        self.draft = screens.iter().zip(&state.screens)
+            .any(|(screen, current)| screen.area() != current.area() || screen.primary != current.primary)
+            .then_some(screens);
+    }
+
+    fn change_scale(&mut self, index: usize, percent: u32, ctx: &egui::Context) {
+        self.edit.hold_open = true;
+        let mut screens = self.state.lock().unwrap().screens.clone();
+        let before = screens[index].clone();
+        let Some(scale) = &mut screens[index].scale else { return };
+        if scale.current == percent {
+            return;
+        }
+        scale.current = percent;
+        if self.preview.is_some() {
+            set_phase_with(&self.state, ctx, Phase::Prompt, Some(screens));
+            return;
+        }
+
+        let (state, ctx) = (self.state.clone(), ctx.clone());
+        set_phase_with(&state, &ctx, Phase::Applying, None);
+        spawn(move || {
+            let pointer = PointerAnchor::capture(&screens);
+            match display::apply_scale(&before, percent) {
+                Ok(changed) => {
+                    {
+                        let settlement = pointer.and_then(|anchor| anchor.restore_now(&screens));
+                        let mut shared = state.lock().unwrap();
+                        shared.needs_taskbar_refresh |= changed;
+                        shared.pointer_settlement = settlement;
+                    }
+                    set_phase_with(&state, &ctx, Phase::Prompt, Some(screens));
+                }
+                Err(error) => {
+                    log::line(&format!("error: {error}"));
+                    finish_display_change(&state, &ctx, Phase::Failed(error), pointer);
+                }
+            }
+        });
+    }
+}
+
+fn refresh_taskbar_detached() {
+    if !config::load().restart_explorer {
+        return;
+    }
+    let result = std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| {
+        install::start_detached(&format!("\"{}\" taskbar", exe.display()))
+    });
+    if let Err(error) = result {
+        log::line(&format!("Could not start the taskbar refresh: {error}"));
     }
 }
 
@@ -425,11 +607,35 @@ impl eframe::App for Card {
     /// Window management lives here because `ui` does not run while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let now = Instant::now();
-        // The screens move under us while we work, so look them up every frame.
-        self.monitors = monitors();
+        let (phase, since) = {
+            let s = self.state.lock().unwrap();
+            (s.phase.clone(), s.since)
+        };
+        // Ignore transient monitor lists during an edit. The completed phase triggers a fresh
+        // poll so all the existing windows move directly to their final work areas.
+        self.recenter = phase != Phase::Applying && self.last_monitor_poll.is_none_or(|last| {
+            since > last || now - last >= MONITOR_POLL
+        });
+        if self.recenter {
+            if let Some(monitors) = monitors(&self.monitors) {
+                self.windows.retain(|id, win| {
+                    *id == ViewportId::ROOT || (monitors.iter().skip(1).any(|m| m.viewport_id() == *id)
+                        && win.hwnd.is_none_or(window_belongs_to_this_process))
+                });
+                let root_changed = self.monitors.first().map(|m| &m.device) != monitors.first().map(|m| &m.device);
+                if root_changed || monitors.len() != self.monitors.len()
+                    || self.edit.drag.as_ref().is_some_and(|drag| !self.windows.contains_key(&drag.viewport))
+                {
+                    self.edit.drag = None;
+                }
+                self.monitors = monitors;
+            }
+            self.last_monitor_poll = Some(now);
+        }
+        ctx.request_repaint_after(MONITOR_POLL);
         let fade_in = self.shown.map_or(0.0, |t| (now - t).as_secs_f32() / FADE_IN).clamp(0.0, 1.0);
         let fade_out = self.closing.map_or(1.0, |t| 1.0 - (now - t).as_secs_f32() / FADE_OUT).clamp(0.0, 1.0);
-        self.alpha = (ease_out(fade_in) * fade_out * 255.0).round() as u8;
+        self.alpha = (ease_out(fade_in) * fade_out * CARD_ALPHA).round() as u8;
 
         self.manage(ctx, ViewportId::ROOT, hwnd(frame), 0);
         if self.windows.get(&ViewportId::ROOT).is_none_or(|w| w.hwnd.is_none()) {
@@ -439,45 +645,74 @@ impl eframe::App for Card {
         self.shown.get_or_insert(now);
         if self.closing.is_some_and(|t| now - t > Duration::from_secs_f32(FADE_OUT + 0.02)) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
+            return;
         }
 
-        let (phase, since) = {
-            let s = self.state.lock().unwrap();
-            (s.phase.clone(), s.since)
-        };
+        let elapsed = now.saturating_duration_since(since);
         match phase {
-            Phase::Done(_) if since.elapsed() > DONE_FOR => self.close(),
-            Phase::Failed(_) if since.elapsed() > FAILED_FOR => self.close(),
-            Phase::Prompt if since.elapsed() >= KEEP_AFTER && self.closing.is_none() => self.act(Action::Keep, ctx),
+            Phase::Working => ctx.request_repaint_after(ANIMATION_TICK),
+            Phase::Kept | Phase::Done(_) if elapsed >= DONE_FOR => self.close(),
+            Phase::Kept | Phase::Done(_) if elapsed < Duration::from_millis(350) => {
+                ctx.request_repaint_after(ANIMATION_TICK);
+            }
+            Phase::Kept | Phase::Done(_) => ctx.request_repaint_after(DONE_FOR - elapsed),
+            Phase::Failed(_) if elapsed >= FAILED_FOR => self.close(),
+            Phase::Prompt if self.edit.auto_keep() && self.closing.is_none() => {
+                if elapsed >= KEEP_AFTER {
+                    self.act(Action::Keep, ctx);
+                } else {
+                    ctx.request_repaint_after(COUNTDOWN_TICK);
+                }
+            }
             _ => {}
         }
-        wait_for_compositor();
-        ctx.request_repaint();
+        if fade_in < 1.0 || self.closing.is_some() {
+            ctx.request_repaint_after(ANIMATION_TICK);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let (phase, since, screens) = {
-            let s = self.state.lock().unwrap();
-            (s.phase.clone(), s.since, s.screens.clone())
+        let (phase, since, screens, settlement) = {
+            let mut s = self.state.lock().unwrap();
+            let settlement = (s.phase != Phase::Applying).then(|| s.pointer_settlement.take()).flatten();
+            (s.phase.clone(), s.since, s.screens.clone(), settlement)
         };
         let ctx = ui.ctx().clone();
         let here: Vec<Option<String>> =
             (0..self.monitors.len().max(1)).map(|m| self.screen_under(&screens, m)).collect();
-        let mut action = draw(ui, &phase, since, &screens, here[0].as_deref());
+        let preview = if let Some(draft) = self.draft.as_mut() && matches!(phase, Phase::Prompt | Phase::Applying) {
+            for (screen, actual) in draft.iter_mut().zip(&screens) {
+                screen.scale = actual.scale;
+            }
+            draft.clone()
+        } else {
+            screens
+        };
+        let rects = physical_rects(&preview);
+        let mut action = draw(ui, &phase, since, &preview, &rects, here[0].as_deref(), &mut self.edit);
 
         // The same card on every other monitor; any of them can be clicked.
-        for monitor in 1..self.monitors.len() {
-            let id = ViewportId::from_hash_of(("card", monitor));
-            let title = format!("auto-display ({})", monitor + 1);
+        for (monitor, here) in here.iter().enumerate().skip(1) {
+            let display = &self.monitors[monitor];
+            let id = display.viewport_id();
+            let title = display.card_title();
             let clicked =
                 ctx.show_viewport_immediate(id, card_viewport(&title), |ui, _| {
-                    draw(ui, &phase, since, &screens, here[monitor].as_deref())
+                    draw(ui, &phase, since, &preview, &rects, here.as_deref(), &mut self.edit)
                 });
             action = action.or(clicked);
-            self.manage(&ctx, id, find_window(&title), monitor);
+            let hwnd = if self.windows.get(&id).is_none_or(|win| win.hwnd.is_none()) {
+                find_card_window(&title)
+            } else {
+                None
+            };
+            self.manage(&ctx, id, hwnd, monitor);
         }
 
-        if let Some(action) = action {
+        if let Some(settlement) = settlement {
+            settlement.finish();
+        }
+        if let Some(action) = action && self.closing.is_none() {
             self.act(action, &ctx);
         }
     }
@@ -490,107 +725,222 @@ fn ease_out(t: f32) -> f32 {
 // ---------------------------------------------------------------------------------------------
 // Drawing.
 
-/// What the prompt is about, worked out from the screens on the card.
-struct Choices {
-    dual: bool,
-    /// Faded laptops wherever the laptop is not.
-    ghosts: Vec<(Side, Screen)>,
+/// Find the closest drop where the screens have a shared edge and do not overlap.
+#[cfg(test)]
+fn snap_position(screens: &[Screen], moving: usize, desired: (i32, i32)) -> Option<(i32, i32)> {
+    let rects: Vec<_> = screens.iter().map(desktop_rect).collect();
+    snap_to_edge(screens, &rects, moving, pos2(desired.0 as f32, desired.1 as f32), 1.0)
+        .map(|snap| snap.position)
 }
 
-fn choices(screens: &[Screen]) -> Choices {
-    let externals: Vec<Area> = screens.iter().filter(|s| !s.internal).map(Screen::area).collect();
-    let laptop = screens.iter().find(|s| s.internal).cloned();
-    let mut ghosts = Vec::new();
-    if let Some(l) = &laptop
-        && !externals.is_empty()
-    {
-        let current = display::laptop_side(&externals, l.area());
-        for side in SIDES.into_iter().filter(|&s| Some(s) != current) {
-            let (x, y) = display::laptop_spot(&externals, (l.width, l.height), side);
-            let id = format!("ghost-{}", fix::side_name(side));
-            ghosts.push((side, Screen { id, x, y, primary: false, ..l.clone() }));
+#[derive(Clone, Copy)]
+struct Snap {
+    position: (i32, i32),
+    rect: Rect,
+    distance_squared: f32,
+}
+
+impl Snap {
+    fn prefer(self, best: &mut Option<Self>) {
+        if best.is_none_or(|old| self.distance_squared < old.distance_squared) {
+            *best = Some(self);
         }
     }
-    Choices { dual: display::is_dual(&externals), ghosts }
+
+    fn near(self, points_per_mm: f32) -> bool {
+        self.distance_squared * points_per_mm.powi(2) <= SNAP_DISTANCE.powi(2)
+    }
+}
+
+/// Find a Windows-valid edge contact, then prefer a nearby alignment visible on the diagram.
+fn snap_to_edge(
+    screens: &[Screen], rects: &[Rect], moving: usize, desired: Pos2, points_per_mm: f32,
+) -> Option<Snap> {
+    let mut areas: Vec<_> = screens.iter().map(Screen::area).collect();
+    let screen = areas[moving];
+    let size = rects[moving].size();
+    let panels: Vec<_> = areas.iter().zip(rects).enumerate()
+        .filter_map(|(index, (&area, &rect))| (index != moving).then_some((area, rect)))
+        .collect();
+    let snap_distance = SNAP_DISTANCE / points_per_mm;
+    let mut nearest = None;
+    let mut clear_seam = None;
+    let mut corner = None;
+    for vertical in [false, true] {
+        let axes = |a: Area| if vertical { (a.y, a.x, a.h, a.w) } else { (a.x, a.y, a.w, a.h) };
+        let (_, _, width, height) = axes(screen);
+        let diagram_axes = |r: Rect| {
+            if vertical { (r.top(), r.left(), r.height(), r.width()) } else { (r.left(), r.top(), r.width(), r.height()) }
+        };
+        let (_, _, moving_w, moving_h) = diagram_axes(rects[moving]);
+        let desired_y = if vertical { desired.x } else { desired.y };
+        let neighbours: Vec<_> = panels.iter().map(|&(area, rect)| (axes(area), diagram_axes(rect))).collect();
+        for &((x, y, w, h), (rx, ry, rw, rh)) in &neighbours {
+            let range = (y - height + 1)..=(y + h - 1);
+            let to_pixels = |mm| y + offset_in_pixels(mm - ry, height, h, moving_h, rh);
+            let min_overlap = (MIN_SEAM / points_per_mm).min(moving_h.min(rh) * 0.25);
+            let offsets = [
+                (to_pixels(desired_y), false),
+                (to_pixels(ry + min_overlap - moving_h), false),
+                (to_pixels(ry + rh - min_overlap), false),
+                (y, true),
+                (to_pixels(ry + rh - moving_h), true),
+            ].into_iter().chain(neighbours.iter().flat_map(|&((_, y, _, h), (_, other_y, _, other_h))| {
+                // Desktop boundaries keep the layout connected. Physical boundaries allow the
+                // same move to clear a third display whose proportions differ in the diagram.
+                [
+                    (y - height, false), (y + h, false),
+                    (y - height + 1, false), (y + h - 1, false),
+                    (to_pixels(other_y - moving_h), false), (to_pixels(other_y + other_h), false),
+                ]
+            }));
+            for (requested, aligned) in offsets {
+                let offset = requested.clamp(*range.start(), *range.end());
+                let diagram_y = ry + offset_in_mm(offset - y, height, h, moving_h, rh);
+                for (edge, diagram_x) in [(x - width, rx - moving_w), (x + w, rx + rw)] {
+                    let (x, y) = if vertical { (offset, edge) } else { (edge, offset) };
+                    areas[moving] = Area { x, y, ..screen };
+                    if !display::valid_layout(&areas) {
+                        continue;
+                    }
+                    if let Some(rect) = corner_rect(areas[moving], size, &panels) {
+                        let snap = Snap { position: (x, y), rect, distance_squared: (rect.min - desired).length_sq() };
+                        snap.prefer(&mut nearest);
+                        snap.prefer(&mut clear_seam);
+                        if snap.near(points_per_mm) {
+                            snap.prefer(&mut corner);
+                        }
+                        continue;
+                    }
+                    let rect = Rect::from_min_size(
+                        if vertical { pos2(diagram_y, diagram_x) } else { pos2(diagram_x, diagram_y) },
+                        size,
+                    );
+                    let snap = Snap { position: (x, y), rect, distance_squared: (rect.min - desired).length_sq() };
+                    snap.prefer(&mut nearest);
+
+                    let overlap = (diagram_y + moving_h).min(ry + rh) - diagram_y.max(ry);
+                    let clear = neighbours.iter().all(|&(_, (nx, ny, nw, nh))| {
+                        (diagram_x + moving_w).min(nx + nw) - diagram_x.max(nx) <= 0.001
+                            || (diagram_y + moving_h).min(ny + nh) - diagram_y.max(ny) <= 0.001
+                    });
+                    if clear && (overlap - min_overlap) * points_per_mm >= -0.25 {
+                        snap.prefer(&mut clear_seam);
+                        if snap.near(points_per_mm) {
+                            let at_three_way_corner = neighbours.iter().any(|&(_, (nx, ny, nw, nh))| {
+                                let crosses = (diagram_x + moving_w).min(nx + nw) > diagram_x.max(nx) + 0.001;
+                                let gap = (diagram_y + moving_h - ny).abs().min((diagram_y - ny - nh).abs());
+                                crosses && gap * points_per_mm <= 0.25
+                            });
+                            if (aligned && offset == requested) || at_three_way_corner {
+                                snap.prefer(&mut corner);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let nearest = nearest?;
+    let clear_seam = clear_seam.filter(|snap| {
+        snap.distance_squared.sqrt() <= nearest.distance_squared.sqrt() + snap_distance
+    });
+    Some(corner.or(clear_seam).unwrap_or(nearest))
+}
+
+fn anchor_primary(screens: &mut [Screen]) {
+    if let Some(main) = screens.iter().find(|s| s.primary) {
+        let (x, y) = (main.x, main.y);
+        for screen in screens {
+            screen.x -= x;
+            screen.y -= y;
+        }
+    }
 }
 
 /// Draws the card. `here` is the id of the screen this card is on, which is highlighted.
-fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen], here: Option<&str>) -> Option<Action> {
+fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen], rects: &[Rect], here: Option<&str>, edit: &mut LayoutEdit) -> Option<Action> {
     let rect = ui.max_rect();
     let painter = ui.painter().clone();
     let t = ui.input(|i| i.time) as f32;
-    let choices = (*phase == Phase::Prompt).then(|| choices(screens));
+    let interactive = *phase == Phase::Prompt;
+    let menu_open = egui::Popup::is_any_open(ui.ctx());
 
     painter.rect_filled(rect, CornerRadius::ZERO, BG);
-    draw_icon(&painter, rect.min + vec2(PAD + 24.0, 58.0), phase, since, t);
+    draw_icon(&painter, rect.min + vec2(PAD + 22.0, 48.0), phase, since, t);
 
     // Title and subtitle.
     let text_x = rect.left() + PAD + 64.0;
     let text_w = rect.right() - PAD - text_x;
     let (title, subtitle) = match phase {
-        Phase::Working(step) => ("Setting up your displays".to_string(), format!("{step}{}", dots(t))),
-        Phase::Prompt => ("Is everything in the right place?".into(), "Adjust the layout below, then choose Keep.".into()),
-        Phase::Done(summary) => ("Displays ready".to_string(), summary.clone()),
-        Phase::Failed(e) => ("Couldn't set up your displays".to_string(), e.clone()),
+        Phase::Working => ("Setting up your screens...", None),
+        Phase::Prompt | Phase::Applying => ("Preview", None),
+        Phase::Done(summary) => ("Displays ready", Some(summary.clone())),
+        Phase::Kept => ("Displays ready", None),
+        Phase::Failed(e) => ("Couldn't set up your displays", Some(e.clone())),
     };
     let (title_font, sub_font) = (semibold(19.0), regular(14.0));
-    let title = fit(&painter, &title, &title_font, text_w);
-    painter.text(pos2(text_x, rect.top() + 46.0), Align2::LEFT_CENTER, title, title_font, TEXT);
-    let subtitle = fit(&painter, &subtitle, &sub_font, text_w);
-    painter.text(pos2(text_x, rect.top() + 71.0), Align2::LEFT_CENTER, subtitle, sub_font, MUTED);
+    let title_y = if subtitle.is_some() { 36.0 } else { 48.0 };
+    let title = fit(&painter, title, &title_font, text_w);
+    painter.text(pos2(text_x, rect.top() + title_y), Align2::LEFT_CENTER, title, title_font, TEXT);
+    if let Some(subtitle) = subtitle {
+        let subtitle = fit(&painter, &subtitle, &sub_font, text_w);
+        painter.text(pos2(text_x, rect.top() + 61.0), Align2::LEFT_CENTER, subtitle, sub_font, MUTED);
+    }
 
-    // Diagram of the screens, drawn to physical scale.
-    let area = Rect::from_min_max(pos2(rect.left() + PAD, rect.top() + 100.0), pos2(rect.right() - PAD, rect.bottom() - 70.0));
-    painter.rect_filled(area, CornerRadius::same(10), SURFACE);
-    painter.rect_stroke(area, CornerRadius::same(10), Stroke::new(1.0, SURFACE_EDGE), StrokeKind::Inside);
-    let ghosts = choices.as_ref().map_or(&[][..], |c| &c.ghosts[..]);
-    let mut action = draw_screens(ui, &painter, area.shrink2(vec2(22.0, 18.0)), screens, ghosts, here).map(Action::MoveLaptop);
+    let area = Rect::from_min_max(pos2(rect.left() + PAD, rect.top() + 84.0), pos2(rect.right() - PAD, rect.bottom() - 74.0));
+    painter.rect_filled(area, CornerRadius::same(12), SURFACE);
+    let mut action = draw_screens(ui, area, screens, rects, here, phase, edit);
+    if edit.drag.is_some() {
+        edit.hold_open = true;
+    }
 
     // Footer.
     let row = Rect::from_min_max(pos2(rect.left() + PAD, rect.bottom() - 54.0), pos2(rect.right() - PAD, rect.bottom() - 20.0));
     let footer_font = regular(13.0);
     match phase {
-        Phase::Prompt => {
-            let dual = choices.as_ref().is_some_and(|c| c.dual);
-            let left = KEEP_AFTER.saturating_sub(since.elapsed()).as_secs_f32();
-            let keep = Rect::from_min_size(pos2(row.right() - 118.0, row.top()), vec2(118.0, row.height()));
-            let mut text_right = keep.left() - 12.0;
-            if dual {
-                let swap = Rect::from_min_size(pos2(keep.left() - 10.0 - 148.0, row.top()), vec2(148.0, row.height()));
-                text_right = swap.left() - 12.0;
-                if button(ui, &painter, swap, "swap", "Swap monitors", false) {
-                    action = Some(Action::SwapMonitors);
-                }
+        Phase::Prompt | Phase::Applying => {
+            let counting = interactive && edit.auto_keep() && !matches!(action, Some(Action::MoveScreen(..)));
+            let keep = Rect::from_min_size(pos2(row.right() - 112.0, row.top()), vec2(112.0, row.height()));
+            let revert = Rect::from_min_size(pos2(keep.left() - 122.0, row.top()), vec2(112.0, row.height()));
+            if button(ui, &painter, keep, "keep", "Keep", true) && interactive && edit.drag.is_none() {
+                action = action.or(Some(Action::Keep));
             }
-            let note = fit(&painter, &format!("Keeping this layout in {}s", left.ceil() as u32), &footer_font, text_right - row.left());
-            painter.text(pos2(row.left(), row.center().y), Align2::LEFT_CENTER, note, footer_font, MUTED);
-            if button(ui, &painter, keep, "keep", "Keep", true) {
-                action = Some(Action::Keep);
+            if button(ui, &painter, revert, "revert", "Revert", false) && interactive && edit.drag.is_none() {
+                action = action.or(Some(Action::Revert));
             }
-            // The countdown drains along the bottom edge of the card.
-            let track = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 3.0), rect.max);
-            painter.rect_filled(track, CornerRadius::ZERO, BUTTON);
-            let fill = Rect::from_min_size(track.min, vec2(track.width() * left / KEEP_AFTER.as_secs_f32(), track.height()));
-            painter.rect_filled(fill, CornerRadius::ZERO, ACCENT);
-            ui.input(|i| {
-                if i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape) {
-                    action = Some(Action::Keep);
-                } else if dual && i.key_pressed(Key::S) {
-                    action = Some(Action::SwapMonitors);
-                }
-            });
+            if counting {
+                let left = KEEP_AFTER.saturating_sub(since.elapsed()).as_secs_f32();
+                let note = fit(&painter, &format!("Keeping in {}s", left.ceil() as u32), &footer_font, revert.left() - row.left() - 12.0);
+                painter.text(pos2(row.left(), row.center().y), Align2::LEFT_CENTER, note, footer_font, MUTED);
+                let track = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 3.0), rect.max);
+                painter.rect_filled(track, CornerRadius::ZERO, BUTTON);
+                let fill = Rect::from_min_size(track.min, vec2(track.width() * left / KEEP_AFTER.as_secs_f32(), track.height()));
+                painter.rect_filled(fill, CornerRadius::ZERO, ACCENT);
+            }
+            if interactive && !menu_open && !egui::Popup::is_any_open(ui.ctx()) {
+                ui.input(|i| {
+                    if i.key_pressed(Key::Escape) {
+                        action = Some(Action::Revert);
+                    } else if action.is_none() && edit.drag.is_none() && i.key_pressed(Key::Enter) {
+                        action = Some(Action::Keep);
+                    }
+                });
+            }
         }
         Phase::Failed(_) => {
             let close = Rect::from_min_size(pos2(row.right() - 104.0, row.top()), vec2(104.0, row.height()));
-            let note = fit(&painter, "Details in auto-display.log", &footer_font, close.left() - row.left() - 16.0);
+            let revert = Rect::from_min_size(pos2(close.left() - 110.0, row.top()), vec2(100.0, row.height()));
+            let note = fit(&painter, "Details in auto-display.log", &footer_font, revert.left() - row.left() - 12.0);
             painter.text(pos2(row.left(), row.center().y), Align2::LEFT_CENTER, note, footer_font, MUTED);
+            if button(ui, &painter, revert, "revert", "Revert", false) {
+                action = Some(Action::Revert);
+            }
             if button(ui, &painter, close, "close", "Close", false) {
                 action = Some(Action::Close);
             }
         }
-        _ => {
-            painter.text(pos2(row.left(), row.center().y), Align2::LEFT_CENTER, "auto-display", footer_font, MUTED);
-        }
+        _ => {}
     }
     action
 }
@@ -598,7 +948,7 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen], he
 fn draw_icon(painter: &Painter, c: Pos2, phase: &Phase, since: Instant, t: f32) {
     let r = 20.0;
     match phase {
-        Phase::Working(_) => {
+        Phase::Working => {
             painter.circle_stroke(c, r, Stroke::new(3.0, BUTTON));
             let start = t * 4.2;
             let sweep = 1.6 + 0.9 * (t * 2.1).sin();
@@ -610,7 +960,7 @@ fn draw_icon(painter: &Painter, c: Pos2, phase: &Phase, since: Instant, t: f32) 
                 .collect();
             painter.add(Shape::line(points, Stroke::new(3.0, ACCENT)));
         }
-        Phase::Prompt => {
+        Phase::Prompt | Phase::Applying => {
             painter.circle_filled(c, r + 2.0, ACCENT.gamma_multiply(0.18));
             // A small screen with a laptop beside it.
             let s = Stroke::new(2.0, ACCENT_TEXT);
@@ -621,7 +971,7 @@ fn draw_icon(painter: &Painter, c: Pos2, phase: &Phase, since: Instant, t: f32) 
             painter.rect_stroke(laptop, CornerRadius::same(1), s, StrokeKind::Middle);
             painter.line_segment([c + vec2(-13.0, 9.0), c + vec2(-3.0, 9.0)], s);
         }
-        Phase::Done(_) => {
+        Phase::Done(_) | Phase::Kept => {
             painter.circle_filled(c, r + 2.0, GOOD.gamma_multiply(0.18));
             let pop = ease_out((since.elapsed().as_secs_f32() / 0.35).min(1.0));
             let s = Stroke::new(3.0, GOOD);
@@ -640,122 +990,209 @@ fn draw_icon(painter: &Painter, c: Pos2, phase: &Phase, since: Instant, t: f32) 
     }
 }
 
-fn dots(t: f32) -> &'static str {
-    ["", ".", "..", "..."][((t * 2.5) as usize) % 4]
+#[cfg(test)]
+fn desktop_rect(screen: &Screen) -> Rect {
+    Rect::from_min_size(pos2(screen.x as f32, screen.y as f32), vec2(screen.width as f32, screen.height as f32))
 }
 
-/// Size of a screen's picture in millimetres, from its EDID, or a guess from its pixels.
-fn size_mm(s: &Screen) -> Vec2 {
-    match s.mm {
-        // EDID describes the panel in landscape; follow the mode if the screen is rotated.
-        Some((w, h)) if w > 0.0 && h > 0.0 => {
-            if (s.width < s.height) != (w < h) { vec2(h, w) } else { vec2(w, h) }
-        }
-        _ => vec2(s.width as f32, s.height as f32) * 0.2,
-    }
-}
-
-/// Places `s` (size `size` mm) against the first already-placed screen it touches on the desktop.
-/// Side by side keeps the vertical offset in proportion; above or below keeps the centre in
-/// proportion, so a laptop centred on a seam stays centred on it.
-fn place(s: &Screen, size: Vec2, placed: &[(Area, Rect)]) -> Option<Rect> {
-    let a = s.area();
-    let near = |p: i32, q: i32| (p - q).abs() <= 1;
-    for (n, r) in placed {
-        let v_overlap = a.y < n.y + n.h && n.y < a.y + a.h;
-        let h_overlap = a.x < n.x + n.w && n.x < a.x + a.w;
-        if v_overlap && (near(a.x + a.w, n.x) || near(a.x, n.x + n.w)) {
-            let x = if near(a.x + a.w, n.x) { r.left() - size.x } else { r.right() };
-            let y = r.top() + (a.y - n.y) as f32 / n.h as f32 * r.height();
-            return Some(Rect::from_min_size(pos2(x, y), size));
-        }
-        if h_overlap && (near(a.y, n.y + n.h) || near(a.y + a.h, n.y)) {
-            let y = if near(a.y, n.y + n.h) { r.bottom() } else { r.top() - size.y };
-            let cx = r.left() + ((a.x as f32 + a.w as f32 / 2.0) - n.x as f32) / n.w as f32 * r.width();
-            return Some(Rect::from_min_size(pos2(cx - size.x / 2.0, y), size));
-        }
-    }
-    None
-}
-
-/// Lays the screens (then the ghosts) out in millimetres, keeping how they touch on the desktop.
-fn physical_layout(screens: &[Screen], ghosts: &[Screen]) -> (Vec<Rect>, Vec<Rect>) {
-    let mut rects: Vec<Option<Rect>> = vec![None; screens.len()];
-    let first = screens.iter().position(|s| s.primary).unwrap_or(0);
-    rects[first] = Some(Rect::from_min_size(Pos2::ZERO, size_mm(&screens[first])));
-    loop {
-        let placed: Vec<(Area, Rect)> = screens.iter().zip(&rects).filter_map(|(s, r)| r.map(|r| (s.area(), r))).collect();
-        let mut progress = false;
-        for (i, s) in screens.iter().enumerate() {
-            if rects[i].is_none()
-                && let Some(r) = place(s, size_mm(s), &placed)
-            {
-                rects[i] = Some(r);
-                progress = true;
-            }
-        }
-        if !progress {
-            break;
-        }
-    }
-    // Anything not touching another screen keeps its pixel offset from the main display, scaled.
-    let anchor = &screens[first];
-    let ratio = size_mm(anchor).x / anchor.width.max(1) as f32;
-    let fallback = |s: &Screen| {
-        Rect::from_min_size(pos2((s.x - anchor.x) as f32 * ratio, (s.y - anchor.y) as f32 * ratio), size_mm(s))
-    };
-    let rects: Vec<Rect> = screens.iter().zip(rects).map(|(s, r)| r.unwrap_or_else(|| fallback(s))).collect();
-    let placed: Vec<(Area, Rect)> = screens.iter().map(Screen::area).zip(rects.iter().copied()).collect();
-    let ghost_rects = ghosts.iter().map(|g| place(g, size_mm(g), &placed).unwrap_or_else(|| fallback(g))).collect();
-    (rects, ghost_rects)
-}
-
-/// Draws the screens to scale, plus clickable ghost laptops. Returns the side of a clicked ghost.
+/// Draws the physical display sizes and their controls.
 fn draw_screens(
-    ui: &egui::Ui,
-    painter: &Painter,
+    ui: &mut egui::Ui,
     area: Rect,
     screens: &[Screen],
-    ghosts: &[(Side, Screen)],
+    rects: &[Rect],
     here: Option<&str>,
-) -> Option<Side> {
+    phase: &Phase,
+    edit: &mut LayoutEdit,
+) -> Option<Action> {
     if screens.is_empty() {
         return None;
     }
-    let ghost_screens: Vec<Screen> = ghosts.iter().map(|(_, g)| g.clone()).collect();
-    let (rects, ghost_rects) = physical_layout(screens, &ghost_screens);
-    let bounds = rects.iter().chain(&ghost_rects).fold(Rect::NOTHING, |b, r| b.union(*r));
+    let painter = ui.painter_at(area);
+    let area = area.shrink2(vec2(22.0, 20.0));
+    let bounds = rects.iter().fold(Rect::NOTHING, |b, &r| b.union(r));
     // Leave room under the laptops for their keyboard decks.
     let room = vec2(area.width(), area.height() - 6.0);
     let scale = (room.x / bounds.width().max(1.0)).min(room.y / bounds.height().max(1.0));
     let offset = area.min + (room - bounds.size() * scale) / 2.0;
-    let to_card = |r: &Rect| Rect::from_min_size(offset + (r.min - bounds.min) * scale, r.size() * scale);
+    let to_card = |r: Rect| {
+        Rect::from_min_size(offset + (r.min - bounds.min) * scale, r.size() * scale)
+    };
 
-    let ctx = ui.ctx();
+    let ctx = ui.ctx().clone();
     let animate = |key: &str, target: Rect| {
         // Viewports share an animation manager, but DPI rounding can give each a different target.
         let id = Id::new(("screen", ctx.viewport_id(), key));
-        let a = |k: &str, v: f32| ctx.animate_value_with_time(id.with(k), v, 0.35);
+        let a = |k: &str, v: f32| ctx.animate_value_with_time(id.with(k), v, 0.15);
         Rect::from_min_size(pos2(a("x", target.left()), a("y", target.top())), vec2(a("w", target.width()), a("h", target.height())))
     };
 
-    let mut clicked = None;
-    for ((side, ghost), r) in ghosts.iter().zip(&ghost_rects) {
-        let r = animate(&ghost.id, to_card(r)).shrink(2.0);
-        let response = ui.interact(r, ui.id().with(&ghost.id), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
-        draw_ghost(painter, r, response.hovered());
-        if response.clicked() {
-            clicked = Some(*side);
+    let viewport = ctx.viewport_id();
+    let editable = *phase == Phase::Prompt;
+    let controls = matches!(phase, Phase::Prompt | Phase::Applying);
+    let drag = &mut edit.drag;
+    let mut action = None;
+    let mut moving = None;
+    for (index, screen) in screens.iter().enumerate() {
+        let target = to_card(rects[index]);
+        let rect = if *phase == Phase::Working { animate(&screen.id, target) } else { target };
+        let buttons = controls.then(|| tile_controls(rect, screens.len() > 1));
+        let controls_top = buttons.map(|(main, scale)| main.map_or(scale.top(), |main| main.top()));
+        if editable && screens.len() > 1 {
+            let button = egui::PointerButton::Primary;
+            let response = ui.interact(rect, ui.id().with((&screen.id, "drag")), Sense::drag())
+                .on_hover_cursor(CursorIcon::Grab);
+            if response.drag_started_by(button) && drag.is_none()
+                && let Some(start) = ui.input(|i| i.pointer.press_origin())
+                && rect.contains(start)
+                && !buttons.is_some_and(|(main, scale)| {
+                    scale.contains(start) || main.is_some_and(|main| main.contains(start))
+                })
+            {
+                *drag = Some(Drag { viewport, screen: index, start, rect, scale, origin_mm: rects[index].min });
+            }
+            if let Some(active) = drag.as_ref().filter(|d| d.viewport == viewport && d.screen == index) {
+                let delta = response.interact_pointer_pos().unwrap_or(active.start) - active.start;
+                let snap = if delta.length_sq() >= 1.0 {
+                    let desired = active.origin_mm + delta / active.scale;
+                    snap_to_edge(screens, rects, index, desired, active.scale)
+                } else {
+                    None
+                };
+                if response.dragged_by(button) {
+                    ctx.set_cursor_icon(CursorIcon::Grabbing);
+                    let snapped = snap.filter(|target| target.near(active.scale));
+                    let rect = snapped.map_or_else(|| active.rect.translate(delta), |target| to_card(target.rect));
+                    moving = Some((index, rect, snapped.is_some()));
+                    continue;
+                }
+                if response.drag_stopped_by(button) && let Some(Snap { position: (x, y), .. }) = snap {
+                    action = Some(Action::MoveScreen(index, x, y));
+                }
+                *drag = None;
+            }
+        }
+        draw_screen(&painter, screen, rect, here == Some(screen.id.as_str()), controls_top);
+        if let Some((main, menu_rect)) = buttons {
+            let editable = editable && drag.is_none();
+            if let Some(main) = main
+                && main_display_button(ui, &painter, screen, main, editable)
+            {
+                action = action.or(Some(Action::SetMain(index)));
+            }
+            let (opened, changed) = scale_menu(ui, &painter, screen, menu_rect, editable);
+            edit.hold_open |= opened;
+            if let Some(percent) = changed {
+                action = action.or(Some(Action::SetScale(index, percent)));
+            }
         }
     }
-    for (s, r) in screens.iter().zip(&rects) {
-        draw_screen(painter, s, animate(&s.id, to_card(r)).shrink(2.0), here == Some(s.id.as_str()));
+    if let Some((index, rect, snapped)) = moving {
+        draw_screen(&painter, &screens[index], rect, true, None);
+        if snapped {
+            for (i, neighbour) in rects.iter().enumerate() {
+                if i != index {
+                    draw_snap_seam(&painter, rect, to_card(*neighbour));
+                }
+            }
+        }
     }
-    clicked
+    action
+}
+
+fn draw_snap_seam(painter: &Painter, tile: Rect, neighbour: Rect) {
+    let stroke = Stroke::new(2.0, ACCENT_TEXT);
+    let shared = tile.intersect(neighbour);
+    // The projections can differ by a fraction of a point after scaling.
+    if shared.width().abs() < 0.1 && shared.height() > 1.0 {
+        painter.line_segment([shared.left_top(), shared.left_bottom()], stroke);
+    }
+    if shared.height().abs() < 0.1 && shared.width() > 1.0 {
+        painter.line_segment([shared.left_top(), shared.right_top()], stroke);
+    }
+}
+
+fn tile_controls(tile: Rect, multiple_displays: bool) -> (Option<Rect>, Rect) {
+    let padding = vec2((tile.width() * 0.12).min(12.0), (tile.height() * 0.14).min(10.0));
+    let inner = tile.shrink2(padding);
+    let max_width = if multiple_displays { 142.0 } else { 76.0 };
+    let size = vec2(inner.width().clamp(1.0, max_width), (tile.height() * 0.36).min(24.0));
+    let row = Rect::from_center_size(pos2(inner.center().x, inner.bottom() - size.y / 2.0), size);
+    if !multiple_displays {
+        return (None, row);
+    }
+    if row.width() < 78.0 && inner.height() > 74.0 {
+        return (Some(row.translate(vec2(0.0, -row.height() - 5.0))), row);
+    }
+    let gap = (row.width() * 0.08).min(6.0);
+    let main_width = (row.width() - gap) * 0.5;
+    let main = Rect::from_min_size(row.min, vec2(main_width, row.height()));
+    let scale = row.with_min_x(main.right() + gap);
+    (Some(main), scale)
+}
+
+fn main_display_button(ui: &egui::Ui, painter: &Painter, screen: &Screen, rect: Rect, editable: bool) -> bool {
+    let enabled = editable && !screen.primary;
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let title = if screen.primary { "Main display" } else { "Make this the main display" };
+    let response = ui.interact(rect, ui.id().with((&screen.id, "main")), sense).on_hover_text(title);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, title));
+    let response = if enabled { response.on_hover_cursor(CursorIcon::PointingHand) } else { response };
+    let fill = if screen.primary { ACCENT } else if response.hovered() && enabled { BUTTON_HOVER } else { BUTTON };
+    painter.rect_filled(rect, CornerRadius::same(5), fill);
+    let font = semibold((rect.width() * 0.23).min(rect.height() * 0.68).clamp(1.0, 12.0));
+    let label = if !screen.primary && rect.width() >= 56.0 { "Make main" } else { "Main" };
+    let label = fit(painter, label, &font, rect.width() - 3.0);
+    centered_text(painter, rect.center(), label, font, TEXT);
+    response.clicked()
+}
+
+fn scale_menu(ui: &mut egui::Ui, painter: &Painter, screen: &Screen, rect: Rect, editable: bool) -> (bool, Option<u32>) {
+    let enabled = editable && screen.scale.is_some();
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let response = ui.interact(rect, ui.id().with((&screen.id, "scale")), sense);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, enabled, "Display scaling"));
+    let response = if enabled { response.on_hover_cursor(CursorIcon::PointingHand) } else { response };
+    let fill = if response.hovered() && enabled { BUTTON_HOVER } else { BUTTON };
+    painter.rect_filled(rect, CornerRadius::same(5), fill);
+
+    let font_size = (rect.width() * 0.22).min(rect.height() * 0.65).clamp(1.0, 12.0);
+    let font = semibold(font_size);
+    let description = screen.scale.map_or_else(|| "Scale".into(), |scale| format!("{}%", scale.current));
+    let arrow = if rect.width() >= 34.0 && screen.scale.is_some() { 5.0 } else { 0.0 };
+    let gap = if arrow > 0.0 { 4.0 } else { 0.0 };
+    let description = fit(painter, &description, &font, rect.width() - gap - arrow - 4.0);
+    let color = if enabled { TEXT } else { MUTED };
+    let galley = painter.layout_no_wrap(description, font, color);
+    let label_width = galley.mesh_bounds.width();
+    let center = rect.center();
+    let label_center = center - vec2((gap + arrow) / 2.0, 0.0);
+    painter.galley(label_center - galley.mesh_bounds.center().to_vec2(), galley, color);
+    if arrow > 0.0 {
+        let x = center.x + (label_width + gap) / 2.0;
+        let stroke = Stroke::new(1.0, color);
+        painter.line_segment([pos2(x - 2.5, center.y - 1.0), pos2(x, center.y + 1.5)], stroke);
+        painter.line_segment([pos2(x, center.y + 1.5), pos2(x + 2.5, center.y - 1.0)], stroke);
+    }
+
+    let popup = egui::Popup::menu(&response).width(rect.width().max(80.0)).show(|ui| {
+        let mut chosen = None;
+        let options = [50, 75].into_iter().chain(display::SCALES.into_iter().take_while(|&p| p <= 300));
+        for percent in options {
+            let allowed = enabled && screen.scale.is_some_and(|s| s.relative_for(percent).is_ok());
+            let selected = screen.scale.is_some_and(|s| s.current == percent);
+            let item = ui.add_enabled(allowed, egui::Button::selectable(selected, format!("{percent}%")));
+            if item.clicked() && !selected {
+                chosen = Some(percent);
+            }
+        }
+        chosen
+    });
+    (response.clicked() || popup.is_some(), popup.and_then(|p| p.inner))
 }
 
 /// Draws one screen. `here` highlights it as the screen this card is on.
-fn draw_screen(painter: &Painter, s: &Screen, r: Rect, here: bool) {
+fn draw_screen(painter: &Painter, s: &Screen, r: Rect, here: bool, controls_top: Option<f32>) {
     let radius = CornerRadius::same(5);
     painter.rect_filled(r, radius, SCREEN);
     if here {
@@ -769,10 +1206,11 @@ fn draw_screen(painter: &Painter, s: &Screen, r: Rect, here: bool) {
         painter.rect_filled(deck, CornerRadius::same(2), SCREEN_EDGE);
     }
 
+    let r = controls_top.map_or(r, |top| r.with_max_y(top - 2.0));
     let name_font = regular(12.5);
     let name = label(painter, &s.name, &name_font, r.width() - 12.0);
     let inches = s.mm.map(|(w, h)| (w * w + h * h).sqrt() / 25.4).filter(|d| *d > 5.0 && !s.name.contains(" + "));
-    let detail = match (s.primary, inches) {
+    let detail = match (s.primary && controls_top.is_none(), inches) {
         (true, Some(d)) => Some((format!("Main display · {d:.0}\""), if here { ACCENT_TEXT } else { MUTED })),
         (true, None) => Some(("Main display".to_string(), if here { ACCENT_TEXT } else { MUTED })),
         (false, Some(d)) => Some((format!("{d:.0}\""), MUTED)),
@@ -791,25 +1229,6 @@ fn draw_screen(painter: &Painter, s: &Screen, r: Rect, here: bool) {
     }
 }
 
-fn draw_ghost(painter: &Painter, r: Rect, hovered: bool) {
-    let colour = if hovered { ACCENT_TEXT } else { MUTED.gamma_multiply(0.55) };
-    if hovered {
-        painter.rect_filled(r, CornerRadius::same(5), ACCENT.gamma_multiply(0.16));
-    }
-    let dashed = |rect: Rect| {
-        let pts = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
-        painter.extend(Shape::dashed_line(&pts, Stroke::new(1.2, colour), 5.0, 4.0));
-    };
-    dashed(r);
-    let deck = Rect::from_min_max(pos2(r.left() - 6.0, r.bottom() + 1.0), pos2(r.right() + 6.0, r.bottom() + 5.0));
-    dashed(deck);
-    let text = "Move here";
-    let width = painter.layout_no_wrap(text.into(), regular(12.0), TEXT).size().x;
-    let scale = ((r.width() - 10.0).max(1.0) / width).min(1.0);
-    let font = regular(12.0 * scale);
-    painter.text(r.center(), Align2::CENTER_CENTER, text, font, if hovered { TEXT } else { MUTED });
-}
-
 fn button(ui: &egui::Ui, painter: &Painter, rect: Rect, id: &str, label: &str, primary: bool) -> bool {
     let response = ui.interact(rect, ui.id().with(id), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
     let hovered = response.hovered();
@@ -820,8 +1239,15 @@ fn button(ui: &egui::Ui, painter: &Painter, rect: Rect, id: &str, label: &str, p
         painter.rect_filled(rect, radius, if hovered { BUTTON_HOVER } else { BUTTON });
         painter.rect_stroke(rect, radius, Stroke::new(1.0, SCREEN_EDGE), StrokeKind::Inside);
     }
-    painter.text(rect.center(), Align2::CENTER_CENTER, label, semibold(14.0), TEXT);
+    centered_text(painter, rect.center(), label.into(), semibold(14.0), TEXT);
     response.clicked()
+}
+
+fn centered_text(painter: &Painter, center: Pos2, label: String, font: FontId, color: Color32) {
+    let galley = painter.layout_no_wrap(label, font, color);
+    if !galley.is_empty() {
+        painter.galley(center - galley.mesh_bounds.center().to_vec2(), galley, color);
+    }
 }
 
 /// A screen's name if it fits, else just the brand ("DELL"), else as much of the name as fits.
@@ -866,7 +1292,7 @@ fn hwnd(frame: &eframe::Frame) -> Option<isize> {
     }
 }
 
-/// Windows 11 rounded corners, a subtle border and a caption strip the colour of the card.
+/// Windows 11 rounded corners with the native outline suppressed.
 fn style_window(h: isize) {
     #[link(name = "dwmapi")]
     unsafe extern "system" {
@@ -876,26 +1302,13 @@ fn style_window(h: isize) {
     const DWMWA_BORDER_COLOR: u32 = 34;
     const DWMWA_CAPTION_COLOR: u32 = 35;
     const DWMWCP_ROUND: u32 = 2;
+    const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
     let colorref = |c: Color32| u32::from_le_bytes([c.r(), c.g(), c.b(), 0]);
-    let border = colorref(SCREEN_EDGE);
     let caption = colorref(BG);
     unsafe {
         DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, (&DWMWCP_ROUND as *const u32).cast(), 4);
-        DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR, (&border as *const u32).cast(), 4);
+        DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR, (&DWMWA_COLOR_NONE as *const u32).cast(), 4);
         DwmSetWindowAttribute(h, DWMWA_CAPTION_COLOR, (&caption as *const u32).cast(), 4);
-    }
-}
-
-/// Blocks until Windows next composes the desktop, so the card draws once per screen refresh however
-/// many windows it has. (egui's own repaint delay cannot do this: it subtracts a frame's duration,
-/// which turns any delay of a frame or less into "repaint immediately".)
-fn wait_for_compositor() {
-    #[link(name = "dwmapi")]
-    unsafe extern "system" {
-        fn DwmFlush() -> i32;
-    }
-    if unsafe { DwmFlush() } < 0 {
-        sleep(Duration::from_millis(16));
     }
 }
 
@@ -911,21 +1324,81 @@ fn set_alpha(h: isize, alpha: u8) {
     }
 }
 
-/// Work areas of the monitors on the desktop, the main display first, then left to right.
-fn monitors() -> Vec<RECT> {
+fn is_layered(h: isize) -> bool {
+    let style = unsafe { GetWindowLongPtrW(h as HWND, GWL_EXSTYLE) };
+    style & WS_EX_LAYERED as isize != 0
+}
+
+struct DesktopMonitor {
+    device: String,
+    desktop: RECT,
+    work: RECT,
+    primary: bool,
+}
+
+impl DesktopMonitor {
+    fn viewport_id(&self) -> ViewportId {
+        ViewportId::from_hash_of(("card", &self.device))
+    }
+
+    fn card_title(&self) -> String {
+        let name = self.device.strip_prefix(r"\\.\").unwrap_or(&self.device);
+        format!("auto-display ({name})")
+    }
+}
+
+/// Match existing cards to the same devices before assigning any newly connected displays.
+fn monitors(previous: &[DesktopMonitor]) -> Option<Vec<DesktopMonitor>> {
     unsafe extern "system" fn collect(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
-        let list = unsafe { &mut *(data as *mut Vec<(bool, RECT)>) };
-        let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
-        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
-            list.push((info.dwFlags & MONITORINFOF_PRIMARY != 0, info.rcWork));
+        let list = unsafe { &mut *(data as *mut Vec<DesktopMonitor>) };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if unsafe { GetMonitorInfoW(monitor, std::ptr::from_mut(&mut info).cast()) } != 0 {
+            let end = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            list.push(DesktopMonitor {
+                device: String::from_utf16_lossy(&info.szDevice[..end]),
+                desktop: info.monitorInfo.rcMonitor,
+                work: info.monitorInfo.rcWork,
+                primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            });
         }
         1
     }
-    let mut list: Vec<(bool, RECT)> = Vec::new();
-    unsafe { EnumDisplayMonitors(null_mut(), null(), Some(collect), &mut list as *mut _ as LPARAM) };
-    list.sort_by_key(|&(primary, r)| (!primary, r.left, r.top));
-    list.into_iter().map(|(_, r)| r).collect()
+    let mut list: Vec<DesktopMonitor> = Vec::new();
+    let ok = unsafe { EnumDisplayMonitors(null_mut(), null(), Some(collect), &mut list as *mut _ as LPARAM) };
+    if ok == 0 || list.is_empty() {
+        return None;
+    }
+    order_monitors(&mut list, previous);
+    Some(list)
+}
+
+fn order_monitors(monitors: &mut [DesktopMonitor], previous: &[DesktopMonitor]) {
+    monitors.sort_by_key(|monitor| {
+        let previous_index = previous.iter().position(|old| old.device == monitor.device);
+        (previous_index.unwrap_or(previous.len()), !monitor.primary, monitor.desktop.left, monitor.desktop.top)
+    });
+}
+
+fn window_belongs_to_this_process(h: isize) -> bool {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(h as HWND, &mut pid) };
+    pid == std::process::id()
+}
+
+fn find_card_window(title: &str) -> Option<isize> {
+    let title = watch::wide(title);
+    let mut after = null_mut();
+    loop {
+        let h = unsafe { FindWindowExW(null_mut(), after, null(), title.as_ptr()) };
+        if h.is_null() {
+            return None;
+        }
+        if window_belongs_to_this_process(h as isize) {
+            return Some(h as isize);
+        }
+        after = h;
+    }
 }
 
 fn find_window(title: &str) -> Option<isize> {
@@ -949,7 +1422,7 @@ fn centre_in(h: isize, work: RECT) {
         let x = work.left + ((work.right - work.left) as f32 - size.x) as i32 / 2;
         let y = work.top + ((work.bottom - work.top) as f32 - size.y) as i32 / 2;
         if (x, y) != (wr.left, wr.top) {
-            SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+            SetWindowPos(hwnd, null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
         }
     }
 }
@@ -958,45 +1431,41 @@ fn centre_in(h: isize, work: RECT) {
 mod tests {
     use super::*;
 
-    fn screen(id: &str, internal: bool, primary: bool, area: (i32, i32, i32, i32), mm: (f32, f32)) -> Screen {
-        let (x, y, width, height) = area;
-        Screen { id: id.into(), name: id.into(), internal, primary, x, y, width, height, mm: Some(mm) }
+    use super::fake as screen;
+
+    #[test]
+    fn changing_the_primary_keeps_each_preview_card_on_its_panel() {
+        let monitor = |name: &str, primary, left| {
+            let desktop = RECT { left, top: 0, right: left + 1920, bottom: 1080 };
+            DesktopMonitor { device: name.into(), desktop, work: desktop, primary }
+        };
+        let before = [monitor("right", true, 0), monitor("left", false, -1920)];
+        let mut after = [monitor("left", true, 0), monitor("right", false, 1920)];
+        order_monitors(&mut after, &before);
+        assert_eq!(after[0].device, "right");
+        assert_eq!(after[0].desktop.left, 1920);
+        assert_eq!(after[1].device, "left");
     }
 
     #[test]
-    fn physical_layout_uses_millimetres_and_keeps_the_seam() {
-        // Two 40" 4K monitors with a 16" laptop centred below the seam.
+    fn portrait_preview_uses_physical_sizes_and_keeps_the_seam() {
         let screens = [
-            screen("left", false, false, (-3840, 0, 3840, 2160), (878.0, 485.0)),
-            screen("right", false, true, (0, 0, 3840, 2160), (878.0, 485.0)),
-            screen("laptop", true, false, (-1920, 2160, 3840, 2400), (345.0, 215.0)),
+            screen("portrait", false, false, (-1440, -2300, 1440, 2560), (597.0, 336.0)),
+            screen("main", false, true, (0, 0, 1920, 1080), (530.0, 300.0)),
         ];
-        let (rects, _) = physical_layout(&screens, &[]);
-        assert_eq!(rects[1], Rect::from_min_size(Pos2::ZERO, vec2(878.0, 485.0)));
-        assert_eq!(rects[0], Rect::from_min_size(pos2(-878.0, 0.0), vec2(878.0, 485.0)));
-        // Much smaller than the monitors, and centred on the seam at x = 0.
-        assert_eq!(rects[2].size(), vec2(345.0, 215.0));
-        assert!((rects[2].center().x).abs() < 0.01);
-        assert_eq!(rects[2].top(), 485.0);
-    }
-
-    #[test]
-    fn ghosts_appear_where_the_laptop_is_not() {
-        let screens = [
-            screen("dell", false, true, (0, 0, 5120, 2160), (977.0, 412.0)),
-            screen("laptop", true, false, (-3840, 1080, 3840, 2400), (345.0, 215.0)),
-        ];
-        let c = choices(&screens);
-        let sides: Vec<Side> = c.ghosts.iter().map(|(s, _)| *s).collect();
-        assert_eq!(sides, vec![Side::Right, Side::Below]);
-        assert!(!c.dual);
-        let ghost_screens: Vec<Screen> = c.ghosts.iter().map(|(_, g)| g.clone()).collect();
-        let (_, ghosts) = physical_layout(&screens, &ghost_screens);
-        // Right ghost: against the monitor's right edge, top halfway down it.
-        assert_eq!(ghosts[0].min, pos2(977.0, 206.0));
-        // Below ghost: centred under the monitor.
-        assert!((ghosts[1].center().x - 977.0 / 2.0).abs() < 0.01);
-        assert_eq!(ghosts[1].top(), 412.0);
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), 0.0, vec![], |ui| {
+            draw(ui, &Phase::Prompt, Instant::now(), &screens, &physical_rects(&screens), None, &mut LayoutEdit::default());
+        });
+        let rects = screen_rects(&output);
+        let portrait = rects[0];
+        let main = rects[1];
+        let scale = main.width() / 530.0;
+        assert!((portrait.width() - 336.0 * scale).abs() < 0.01);
+        assert!((portrait.height() - 597.0 * scale).abs() < 0.01);
+        assert!((portrait.right() - main.left()).abs() < 0.01);
+        assert!((portrait.bottom() - main.top() - (260.0 / 2560.0 * 597.0) * scale).abs() < 0.01);
     }
 
     fn paint_frame(
@@ -1004,6 +1473,7 @@ mod tests {
         viewport: ViewportId,
         size: Vec2,
         time: f64,
+        events: Vec<egui::Event>,
         paint: impl FnMut(&mut egui::Ui),
     ) -> egui::FullOutput {
         let input = egui::RawInput {
@@ -1011,6 +1481,7 @@ mod tests {
             viewports: [(viewport, egui::ViewportInfo::default())].into_iter().collect(),
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
             time: Some(time),
+            events,
             ..Default::default()
         };
         let mut paint = paint;
@@ -1030,7 +1501,7 @@ mod tests {
     fn screen_animations_are_independent_on_each_monitor() {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
-        let screens = Preview { kind: "dual".into(), laptop: Side::Below, swapped: false }.screens();
+        let screens = Preview { kind: "dual".into() }.screens();
         // Different DPI rounding/window sizes give each viewport different diagram coordinates.
         let viewports = [
             (ViewportId::ROOT, vec2(WIDTH, HEIGHT)),
@@ -1040,8 +1511,8 @@ mod tests {
         for (viewport, size) in viewports {
             let isolated = egui::Context::default();
             install_fonts(&isolated);
-            let output = paint_frame(&isolated, viewport, size, 0.0, |ui| {
-                draw(ui, &Phase::Prompt, Instant::now(), &screens, None);
+            let output = paint_frame(&isolated, viewport, size, 0.0, vec![], |ui| {
+                draw(ui, &Phase::Prompt, Instant::now(), &screens, &physical_rects(&screens), None, &mut LayoutEdit::default());
             });
             let rects = screen_rects(&output);
             assert_eq!(rects.len(), screens.len());
@@ -1049,11 +1520,290 @@ mod tests {
         }
         for frame in 0..120 {
             for (i, (viewport, size)) in viewports.into_iter().enumerate() {
-                let output = paint_frame(&ctx, viewport, size, frame as f64 / 60.0, |ui| {
-                    draw(ui, &Phase::Prompt, Instant::now(), &screens, None);
+                let output = paint_frame(&ctx, viewport, size, frame as f64 / 60.0, vec![], |ui| {
+                    draw(ui, &Phase::Prompt, Instant::now(), &screens, &physical_rects(&screens), None, &mut LayoutEdit::default());
                 });
                 assert_eq!(screen_rects(&output), expected[i], "frame {frame}, monitor {i}");
             }
+        }
+    }
+
+    #[test]
+    fn dropping_a_physically_sized_tile_saves_its_desktop_position_on_keep() {
+        use egui::{Event, Modifiers, PointerButton};
+
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let screens = vec![
+            screen("portrait", false, false, (-1080, 0, 1080, 1920), (597.0, 336.0)),
+            screen("main", false, true, (0, 0, 1920, 1080), (530.0, 300.0)),
+        ];
+        let since = Instant::now();
+        let state = Arc::new(Mutex::new(Shared { phase: Phase::Prompt, since, screens: screens.clone(), needs_taskbar_refresh: false, pointer_settlement: None }));
+        let mut card = Card::new(state.clone(), Some(Preview { kind: "portrait".into() }), None);
+        let mut time = 0.0;
+        let mut frame = |events, edit: &mut LayoutEdit| {
+            let mut action = None;
+            let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), time, events, |ui| {
+                action = draw(ui, &Phase::Prompt, since, &screens, &physical_rects(&screens), None, edit);
+            });
+            time += 0.1;
+            (screen_rects(&output), action)
+        };
+        let (rects, _) = frame(vec![], &mut card.edit);
+        let start = rects[0].center();
+        let scale = rects[1].width() / 530.0;
+        let end = start + vec2(530.0 + 336.0 + 20.0, 300.0 * 300.0 / 1080.0) * scale;
+        let mouse = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(vec![Event::PointerMoved(start), mouse(start, true)], &mut card.edit);
+        assert!(card.edit.drag.is_some());
+        let far = end + vec2(30.0, 0.0);
+        let (dragged, action) = frame(vec![Event::PointerMoved(far)], &mut card.edit);
+        assert!(action.is_none());
+        assert!((dragged[1].center() - far).length() < 0.01);
+        let (snapped, action) = frame(vec![Event::PointerMoved(end)], &mut card.edit);
+        assert!(action.is_none());
+        assert!((snapped[1].left() - snapped[0].right()).abs() < 0.01);
+        assert_eq!(state.lock().unwrap().screens, screens);
+        let (_, drop) = frame(vec![mouse(end, false)], &mut card.edit);
+        card.act(drop.expect("drop action"), &ctx);
+        assert_eq!(state.lock().unwrap().screens, screens);
+        let moved = card.draft.as_ref().unwrap().clone();
+        assert_eq!((moved[0].x, moved[0].y), (1920, 300));
+
+        let keep = pos2(WIDTH - PAD - 50.0, HEIGHT - 37.0);
+        frame(vec![Event::PointerMoved(keep), mouse(keep, true)], &mut card.edit);
+        let (_, action) = frame(vec![mouse(keep, false)], &mut card.edit);
+        assert!(matches!(action, Some(Action::Keep)));
+        card.act(action.unwrap(), &ctx);
+        let saved = state.lock().unwrap();
+        assert_eq!(saved.screens, moved);
+        assert!(matches!(saved.phase, Phase::Kept));
+        assert!(card.closing.is_none());
+    }
+
+    #[test]
+    fn snaps_to_aligned_corners_from_either_axis() {
+        let screens = [
+            screen("main", false, true, (0, 0, 200, 120), (200.0, 120.0)),
+            screen("other", false, false, (-80, 0, 80, 60), (80.0, 60.0)),
+        ];
+
+        assert_eq!(snap_position(&screens, 1, (204, 6)), Some((200, 0)));
+        assert_eq!(snap_position(&screens, 1, (202, 57)), Some((200, 60)));
+        assert_eq!(snap_position(&screens, 1, (4, 121)), Some((0, 120)));
+        assert_eq!(snap_position(&screens, 1, (118, 122)), Some((120, 120)));
+        assert_eq!(snap_position(&screens, 1, (202, 22)), Some((200, 22)));
+    }
+
+    #[test]
+    fn snaps_to_the_corner_shared_by_two_neighbours() {
+        let screens = [
+            screen("main", false, true, (0, 0, 200, 180), (200.0, 180.0)),
+            screen("upper", false, false, (-100, 0, 100, 90), (100.0, 90.0)),
+            screen("moving", false, false, (200, 0, 100, 60), (100.0, 60.0)),
+        ];
+
+        assert_eq!(snap_position(&screens, 2, (-103, 95)), Some((-100, 90)));
+    }
+
+    #[test]
+    fn laptop_fits_below_main_and_beside_portrait_with_different_pixel_densities() {
+        let mut screens = [
+            screen("laptop", true, false, (-3840, 890, 3840, 2400), (344.0, 215.0)),
+            screen("portrait", false, false, (2560, -443, 1080, 1920), (530.0, 280.0)),
+            screen("main", false, true, (0, 0, 2560, 1440), (597.0, 336.0)),
+        ];
+        let rects = physical_rects(&screens);
+        let desired = pos2(rects[1].left() - rects[0].width() + 4.0, rects[2].bottom() + 3.0);
+
+        let (x, y) = snap_to_edge(&screens, &rects, 0, desired, 0.31).unwrap().position;
+        assert_eq!((x, y), (-1280, 1440));
+        (screens[0].x, screens[0].y) = (x, y);
+        assert!(display::valid_layout(&screens.iter().map(Screen::area).collect::<Vec<_>>()));
+
+        let [laptop, portrait, main]: [Rect; 3] = physical_rects(&screens).try_into().unwrap();
+        assert_eq!(laptop.size(), vec2(344.0, 215.0));
+        assert_eq!(laptop.top(), main.bottom());
+        assert_eq!(laptop.right(), portrait.left());
+    }
+
+    #[test]
+    fn drags_laptop_straight_from_the_inside_corner_to_the_left_of_main() {
+        use egui::{Event, Modifiers, PointerButton};
+
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let screens = vec![
+            screen("laptop", true, false, (-1280, 1440, 3840, 2400), (344.0, 215.0)),
+            screen("portrait", false, false, (2560, -443, 1080, 1920), (530.0, 280.0)),
+            screen("main", false, true, (0, 0, 2560, 1440), (597.0, 336.0)),
+        ];
+        let state = Arc::new(Mutex::new(Shared {
+            phase: Phase::Prompt, since: Instant::now(), screens: screens.clone(),
+            needs_taskbar_refresh: false, pointer_settlement: None,
+        }));
+        let mut card = Card::new(state.clone(), Some(Preview { kind: "portrait".into() }), None);
+        let diagram = physical_rects(&screens);
+        let mut time = 0.0;
+        let mut frame = |events, edit: &mut LayoutEdit| {
+            let mut action = None;
+            let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), time, events, |ui| {
+                action = draw(ui, &Phase::Prompt, Instant::now(), &screens, &diagram, None, edit);
+            });
+            time += 0.1;
+            (screen_rects(&output), action)
+        };
+        let (tiles, _) = frame(vec![], &mut card.edit);
+        let [laptop, _, main]: [Rect; 3] = tiles.try_into().unwrap();
+        // The padded part next to the controls is still part of the tile.
+        let start = laptop.left_top() + vec2(3.0, laptop.height() * 0.72);
+        let desired = pos2(main.left() - laptop.width() + 4.0, main.top() + 5.0);
+        let end = start + (desired - laptop.min);
+        let mouse = |pos, pressed| Event::PointerButton {
+            pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        };
+
+        frame(vec![Event::PointerMoved(start), mouse(start, true)], &mut card.edit);
+        assert!(card.edit.drag.is_some(), "The laptop tile must drag from its padded body.");
+        let (snapped, action) = frame(vec![Event::PointerMoved(end)], &mut card.edit);
+        assert!(action.is_none());
+        let tile = snapped.last().unwrap();
+        assert!((tile.right() - main.left()).abs() < 0.01);
+        assert!((tile.top() - main.top()).abs() < 0.01);
+        let (_, drop) = frame(vec![mouse(end, false)], &mut card.edit);
+        card.act(drop.expect("laptop drop"), &ctx);
+
+        let staged = card.draft.as_ref().unwrap();
+        assert_eq!((staged[0].x, staged[0].y), (-3840, 0));
+        assert_eq!(staged[1..], screens[1..]);
+        assert_eq!(state.lock().unwrap().screens, screens);
+    }
+
+    #[test]
+    fn bottom_corner_alignment_uses_physical_sizes_at_mixed_resolutions() {
+        let screens = [
+            screen("main", false, true, (0, 0, 1920, 1080), (530.0, 300.0)),
+            screen("portrait", false, false, (-1080, 0, 1080, 1920), (597.0, 336.0)),
+        ];
+        let rects = physical_rects(&screens);
+        let wanted = pos2(536.0, 300.0 - 597.0 + 14.0);
+        let (x, y) = snap_to_edge(&screens, &rects, 1, wanted, 0.4).unwrap().position;
+        assert_eq!(x, 1920);
+        let top = offset_in_mm(y, 1920, 1080, 597.0, 300.0);
+        assert!((top + 597.0 - 300.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn snapping_preserves_connections_when_moving_a_bridge_display() {
+        let screens = [
+            screen("left", false, false, (-100, 0, 100, 100), (1.0, 1.0)),
+            screen("main", false, true, (0, 0, 100, 100), (1.0, 1.0)),
+            screen("right", false, false, (100, 0, 100, 100), (1.0, 1.0)),
+        ];
+        // Leave a visible shared seam on both sides.
+        assert_eq!(snap_position(&screens, 1, (0, 110)), Some((0, 92)));
+        assert_eq!(snap_position(&screens, 2, (0, -120)), Some((0, -100)));
+    }
+
+    #[test]
+    fn inline_scaling_applies_to_one_display_and_revert_restores_it() {
+        use egui::{Event, Modifiers, PointerButton};
+
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let preview = Preview { kind: "portrait".into() };
+        let screens = preview.screens();
+        let since = Instant::now();
+        let state = Arc::new(Mutex::new(Shared { phase: Phase::Prompt, since, screens: screens.clone(), needs_taskbar_refresh: false, pointer_settlement: None }));
+        let mut card = Card::new(state.clone(), Some(preview), None);
+        card.act(Action::SetMain(0), &ctx);
+        assert_eq!(state.lock().unwrap().screens, screens);
+        let mut time = 0.0;
+        let mut frame = |events, edit: &mut LayoutEdit| {
+            let mut action = None;
+            let current = state.lock().unwrap().screens.clone();
+            let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), time, events, |ui| {
+                action = draw(ui, &Phase::Prompt, since, &current, &physical_rects(&current), None, edit);
+            });
+            time += 0.1;
+            (output, action)
+        };
+        let text_center = |output: &egui::FullOutput, label: &str| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                Shape::Text(text) if text.galley.text() == label => Some(text.pos + text.galley.size() / 2.0),
+                _ => None,
+            }).unwrap_or_else(|| panic!("could not find {label}"))
+        };
+        let mouse = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let (output, _) = frame(vec![], &mut card.edit);
+        let controls = screen_rects(&output);
+        let scale = tile_controls(controls[1], true).1.center();
+        frame(vec![Event::PointerMoved(scale), mouse(scale, true)], &mut card.edit);
+        frame(vec![mouse(scale, false)], &mut card.edit);
+        let (popup, _) = frame(vec![], &mut card.edit);
+        let option = text_center(&popup, "125%");
+        frame(vec![Event::PointerMoved(option), mouse(option, true)], &mut card.edit);
+        let (_, action) = frame(vec![mouse(option, false)], &mut card.edit);
+        assert!(matches!(action, Some(Action::SetScale(1, 125))));
+        card.act(action.unwrap(), &ctx);
+        let applied = state.lock().unwrap().screens.clone();
+        assert_eq!(applied[1].scale.unwrap().current, 125);
+        assert_eq!(applied[0].scale, screens[0].scale);
+        assert!(card.draft.as_ref().unwrap()[0].primary);
+        assert_eq!(applied[0].area(), screens[0].area());
+        assert!(!applied[0].primary);
+
+        let revert = pos2(WIDTH - PAD - 168.0, HEIGHT - 37.0);
+        frame(vec![Event::PointerMoved(revert), mouse(revert, true)], &mut card.edit);
+        let (_, action) = frame(vec![mouse(revert, false)], &mut card.edit);
+        assert!(matches!(action, Some(Action::Revert)));
+        card.act(action.unwrap(), &ctx);
+        assert!(card.draft.is_none());
+        assert_eq!(state.lock().unwrap().screens, screens);
+    }
+
+    #[test]
+    fn main_button_stages_the_primary_without_changing_relative_positions() {
+        use egui::{Event, Modifiers, PointerButton};
+
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let preview = Preview { kind: "portrait".into() };
+        let screens = preview.screens();
+        let since = Instant::now();
+        let state = Arc::new(Mutex::new(Shared {
+            phase: Phase::Prompt, since, screens: screens.clone(), needs_taskbar_refresh: false, pointer_settlement: None,
+        }));
+        let mut card = Card::new(state.clone(), Some(preview), None);
+        let portrait = screens.iter().position(|s| s.rotation.swaps_axes()).unwrap();
+        assert!(!screens[portrait].primary);
+
+        let mut time = 0.0;
+        let mut frame = |events, edit: &mut LayoutEdit| {
+            let mut action = None;
+            let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), time, events, |ui| {
+                action = draw(ui, &Phase::Prompt, since, &screens, &physical_rects(&screens), None, edit);
+            });
+            time += 0.1;
+            (screen_rects(&output), action)
+        };
+        let (tiles, _) = frame(vec![], &mut card.edit);
+        let main = tile_controls(tiles[portrait], true).0.unwrap().center();
+        let click = |pressed| Event::PointerButton { pos: main, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(vec![Event::PointerMoved(main), click(true)], &mut card.edit);
+        let (_, action) = frame(vec![click(false)], &mut card.edit);
+        assert!(matches!(action, Some(Action::SetMain(i)) if i == portrait));
+        card.act(action.unwrap(), &ctx);
+
+        assert_eq!(state.lock().unwrap().screens, screens);
+        let current = card.draft.as_ref().unwrap();
+        assert_eq!(current.iter().filter(|s| s.primary).count(), 1);
+        assert!(current[portrait].primary);
+        assert_eq!((current[portrait].x, current[portrait].y), (0, 0));
+        for (before, after) in screens.iter().zip(current) {
+            assert_eq!((after.x, after.y), (before.x - screens[portrait].x, before.y - screens[portrait].y));
+            assert_eq!(after.scale, before.scale);
         }
     }
 
@@ -1064,9 +1814,14 @@ mod tests {
         ctx.tessellation_options_mut(|o| o.prerasterized_discs = false);
         let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(118.0, 34.0));
         for primary in [false, true] {
-            let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), 0.0, |ui| {
+            let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), 0.0, vec![], |ui| {
                 button(ui, ui.painter(), rect, "test button", "Keep", primary);
             });
+            let glyph_center = output.shapes.iter().find_map(|shape| match &shape.shape {
+                Shape::Text(text) if text.galley.text() == "Keep" => Some(text.pos + text.galley.mesh_bounds.center().to_vec2()),
+                _ => None,
+            }).unwrap();
+            assert!((glyph_center - rect.center()).length() < 0.01);
             let meshes = ctx.tessellate(output.shapes, output.pixels_per_point);
             let covered = |point: Pos2| meshes.iter().any(|p| {
                 let egui::epaint::Primitive::Mesh(mesh) = &p.primitive else { return false };

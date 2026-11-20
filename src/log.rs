@@ -24,7 +24,8 @@ pub fn line(msg: &str) {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {msg}\n",
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
     );
-    print!("{text}");
+    // A detached setup can outlive the console or the pipe that launched it.
+    let _ = std::io::stdout().write_all(text.as_bytes());
 
     let path = path();
     let _ = fs::create_dir_all(data_dir());

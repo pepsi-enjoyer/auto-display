@@ -16,7 +16,7 @@ const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
 
 const USAGE: &str = "\
 auto-display: when a docked laptop comes up in duplicate mode, switch to extend, make the external
-display primary with the laptop screen to its left, and set external displays to 150%.
+display primary with the laptop screen to its left, and apply resolution-adjusted scaling.
 
 Usage: auto-display [command]
 
@@ -33,7 +33,7 @@ Usage: auto-display [command]
   swap        Swap the two external monitors
   config      Create config.toml if needed and print its path
   watch       Run the watcher in this session (what the sign-in entry runs)
-  preview [dual|single|done|error]
+  preview [dual|portrait|single|done|error]
               Play the on-screen card with made-up screens; changes nothing";
 
 fn main() {
@@ -96,18 +96,19 @@ fn status() -> Result<(), String> {
         if display::is_duplicate(&cfg.paths) { "duplicate" } else { "extend (or single display)" }
     );
     for p in &cfg.paths {
-        let m = cfg.modes.get(p.source.mode_info_idx as usize).map(|m| m.source_mode());
+        let m = cfg.modes.get(p.source.mode_info_idx as usize).map(|m| display::desktop_area(p, m));
         let scale = display::scale(p).map(|s| format!("{}% (recommended {}%)", s.current, s.recommended));
         match m {
             Some(m) => println!(
-                "  {} {:<24} {}x{} at ({}, {}){}  scale {}",
+                "  {} {:<24} {}x{} at ({}, {}){}  {}  scale {}",
                 display::gdi_name(p),
                 display::monitor_name(p),
-                m.width,
-                m.height,
+                m.w,
+                m.h,
                 m.x,
                 m.y,
                 if m.x == 0 && m.y == 0 { " main" } else { "" },
+                p.rotation().label(),
                 scale.unwrap_or_else(|e| e)
             ),
             None => println!("  {} {}", display::gdi_name(p), display::monitor_name(p)),

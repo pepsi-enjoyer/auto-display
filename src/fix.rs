@@ -1,29 +1,35 @@
-use std::thread::sleep;
-use std::time::Duration;
-
 use crate::display::{self, Side};
 use crate::{config, log, shell};
 
-/// Headless fix, used when the on-screen card cannot start: if the displays are duplicated, extend,
-/// arrange and scale them.
+/// Restore the Windows display layout when newly connected monitors come up duplicated.
 pub fn if_duplicate() -> Result<bool, String> {
     if !display::is_duplicate(&display::active()?.paths) {
         return Ok(false);
     }
     log::line("Displays are duplicated; switching to extend.");
     display::extend()?;
-    sleep(Duration::from_millis(1500));
-    apply_layout()?;
+    setup_current_layout()?;
     Ok(true)
 }
 
-/// Headless setup, used when the on-screen card cannot start: extend if duplicated, then arrange
-/// and scale.
+/// Prepare the desktop if the on-screen card cannot start.
 pub fn setup() -> Result<(), String> {
     if !if_duplicate()? {
-        apply_layout()?;
+        setup_current_layout()?;
     }
     Ok(())
+}
+
+fn setup_current_layout() -> Result<(), String> {
+    match display::remembered_layout(&display::screens()?) {
+        display::StartupLayout::Current => Ok(()),
+        display::StartupLayout::Remembered => {
+            display::restore_remembered_layout()?;
+            log::line("Restored the Windows layout for these displays.");
+            Ok(())
+        }
+        display::StartupLayout::Defaults => apply_layout().map(|_| ()),
+    }
 }
 
 /// Arranges the screens and applies the configured scaling.
@@ -73,14 +79,10 @@ pub fn side_name(side: Side) -> &'static str {
 pub fn scale() -> Result<bool, String> {
     let config = config::load();
     let mut changed = false;
-    for (internal, percent, what) in [
-        (false, config.external_scale, "external display(s)"),
-        (true, config.laptop_scale, "laptop screen(s)"),
-    ] {
+    for (internal, percent) in [(false, config.external_scale), (true, config.laptop_scale)] {
         let Some(percent) = percent else { continue };
-        let n = display::scale_screens(internal, percent)?;
-        if n > 0 {
-            log::line(&format!("Set {n} {what} to {percent}%."));
+        for (name, applied) in display::scale_screens(internal, percent)? {
+            log::line(&format!("Set {name} to {applied}% scaling."));
             changed = true;
         }
     }

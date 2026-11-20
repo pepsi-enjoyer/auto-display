@@ -3,8 +3,15 @@
 //! The structs are declared here rather than taken from windows-sys so their layout is explicit and
 //! the undocumented DPI-scale packets (types -3 and -4) can sit next to the documented ones.
 
+use std::collections::HashSet;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
+
+mod placement;
+mod remembered;
+mod settings;
+pub use remembered::{StartupLayout, remembered_layout, restore_remembered_layout};
+pub use settings::{Snapshot, apply_scale};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -14,11 +21,12 @@ pub const SCALES: [u32; 12] = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400,
 
 const QDC_ALL_PATHS: u32 = 0x1;
 const QDC_ONLY_ACTIVE_PATHS: u32 = 0x2;
+const QDC_DATABASE_CURRENT: u32 = 0x4;
 const SDC_TOPOLOGY_EXTEND: u32 = 0x4;
 const SDC_USE_SUPPLIED_DISPLAY_CONFIG: u32 = 0x20;
+const SDC_VALIDATE: u32 = 0x40;
 const SDC_APPLY: u32 = 0x80;
 const SDC_SAVE_TO_DATABASE: u32 = 0x200;
-const SDC_ALLOW_CHANGES: u32 = 0x400;
 const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 const MODE_INFO_TYPE_SOURCE: u32 = 1;
 const PATH_ACTIVE: u32 = 0x1;
@@ -83,6 +91,40 @@ impl PathInfo {
     fn source_key(&self) -> (Luid, u32) {
         (self.source.adapter_id, self.source.id)
     }
+
+    pub fn rotation(&self) -> Rotation {
+        match self.target.rotation {
+            2 => Rotation::Portrait,
+            3 => Rotation::LandscapeFlipped,
+            4 => Rotation::PortraitFlipped,
+            _ => Rotation::Landscape,
+        }
+    }
+}
+
+/// Windows display target rotation, in clockwise quarter turns.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rotation {
+    Landscape = 1,
+    Portrait = 2,
+    LandscapeFlipped = 3,
+    PortraitFlipped = 4,
+}
+
+impl Rotation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Landscape => "Landscape",
+            Self::Portrait => "Portrait",
+            Self::LandscapeFlipped => "Landscape (flipped)",
+            Self::PortraitFlipped => "Portrait (flipped)",
+        }
+    }
+
+    pub fn swaps_axes(self) -> bool {
+        matches!(self, Self::Portrait | Self::PortraitFlipped)
+    }
 }
 
 /// DISPLAYCONFIG_MODE_INFO: a 16-byte header followed by a 48-byte union.
@@ -117,6 +159,13 @@ impl ModeInfo {
         let sm = unsafe { &mut *(self.data.as_mut_ptr() as *mut SourceMode) };
         sm.x = x;
         sm.y = y;
+    }
+
+    fn set_area(&mut self, area: Area) {
+        // SAFETY: This is called on source modes matched by screens_with_modes().
+        let sm = unsafe { &mut *(self.data.as_mut_ptr() as *mut SourceMode) };
+        (sm.x, sm.y) = (area.x, area.y);
+        (sm.width, sm.height) = (area.w as u32, area.h as u32);
     }
 }
 
@@ -202,14 +251,37 @@ pub struct Config {
     pub modes: Vec<ModeInfo>,
 }
 
+impl Config {
+    fn apply(&self, extra_flags: u32, action: &str) -> Result<()> {
+        self.set(SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | extra_flags, action)
+    }
+
+    fn set(&self, flags: u32, action: &str) -> Result<()> {
+        check(
+            unsafe {
+                SetDisplayConfig(
+                    self.paths.len() as u32,
+                    self.paths.as_ptr(),
+                    self.modes.len() as u32,
+                    self.modes.as_ptr(),
+                    flags,
+                )
+            },
+            action,
+        )
+    }
+}
+
 fn query(flags: u32) -> Result<Config> {
     loop {
         let (mut np, mut nm) = (0u32, 0u32);
         check(unsafe { GetDisplayConfigBufferSizes(flags, &mut np, &mut nm) }, "GetDisplayConfigBufferSizes")?;
         let mut paths = vec![PathInfo::default(); np as usize];
         let mut modes = vec![ModeInfo::default(); nm as usize];
+        let mut topology = 0;
+        let topology_out = if flags == QDC_DATABASE_CURRENT { &mut topology } else { null_mut() };
         let rc = unsafe {
-            QueryDisplayConfig(flags, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), null_mut())
+            QueryDisplayConfig(flags, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), topology_out)
         };
         // The configuration can change between the two calls; ask again for the new sizes.
         if rc == ERROR_INSUFFICIENT_BUFFER {
@@ -284,6 +356,37 @@ pub struct Area {
     pub h: i32,
 }
 
+/// The desktop must form a connected set of screens with no overlapping interiors.
+pub fn valid_layout(areas: &[Area]) -> bool {
+    if areas.is_empty() || areas.iter().any(|area| area.w <= 0 || area.h <= 0) {
+        return false;
+    }
+    let mut connected = vec![false; areas.len()];
+    let mut pending = vec![0];
+    connected[0] = true;
+    while let Some(i) = pending.pop() {
+        let a = areas[i];
+        for (j, &b) in areas.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let extent = |a: i32, a_len: i32, b: i32, b_len: i32| {
+                (i64::from(a) + i64::from(a_len)).min(i64::from(b) + i64::from(b_len)) - i64::from(a.max(b))
+            };
+            let x = extent(a.x, a.w, b.x, b.w);
+            let y = extent(a.y, a.h, b.y, b.h);
+            if x > 0 && y > 0 {
+                return false;
+            }
+            if !connected[j] && ((x == 0 && y > 0) || (x > 0 && y == 0)) {
+                connected[j] = true;
+                pending.push(j);
+            }
+        }
+    }
+    connected.into_iter().all(|adjacent| adjacent)
+}
+
 /// Two external monitors, neither ultrawide: they sit side by side and the right one is primary.
 pub fn is_dual(externals: &[Area]) -> bool {
     externals.len() == 2 && externals.iter().all(|a| !is_ultrawide(a.w, a.h))
@@ -318,13 +421,39 @@ fn area(m: &ModeInfo) -> Area {
     Area { x: sm.x, y: sm.y, w: sm.width as i32, h: sm.height as i32 }
 }
 
+/// GDI supplies the desktop geometry in physical pixels. CCD source sizes can describe the raw
+/// surface before rotation, even though its position is already in desktop coordinates.
+pub fn desktop_area(p: &PathInfo, m: &ModeInfo) -> Area {
+    use windows_sys::Win32::Graphics::Gdi::{
+        DEVMODEW, DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsExW,
+    };
+
+    let device = crate::watch::wide(&gdi_name(p));
+    let mut mode = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+    let fields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_POSITION;
+    if unsafe { EnumDisplaySettingsExW(device.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode, 0) } != 0
+        && mode.dmFields & fields == fields && mode.dmPelsWidth > 0 && mode.dmPelsHeight > 0
+    {
+        // SAFETY: A display call populated the mode's position field.
+        let pos = unsafe { mode.Anonymous1.Anonymous2.dmPosition };
+        return Area { x: pos.x, y: pos.y, w: mode.dmPelsWidth as i32, h: mode.dmPelsHeight as i32 };
+    }
+
+    let mut desktop = area(m);
+    if p.rotation().swaps_axes() && desktop.w > desktop.h {
+        (desktop.w, desktop.h) = (desktop.h, desktop.w);
+    }
+    desktop
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
     /// (mode index, x, y) in physical pixels.
     pub moves: Vec<(usize, i32, i32)>,
     /// The two-monitor layout, whose order may need swapping.
     pub dual: bool,
-    /// Where the laptop screen ends up, if it is on.
+    /// Where the laptop screen ends up, used by planner tests.
+    #[cfg(test)]
     pub laptop: Option<Side>,
 }
 
@@ -385,57 +514,131 @@ pub fn plan_layout(paths: &[PathInfo], modes: &[ModeInfo], laptop: Option<Side>,
         moves.push((idx, x, y));
         next = Some((x + a.w, y));
     }
-    Plan { moves, dual, laptop: (!internals.is_empty()).then_some(side) }
+    Plan { moves, dual, #[cfg(test)] laptop: (!internals.is_empty()).then_some(side) }
 }
 
 #[derive(Debug, Default)]
 pub struct Arrangement {
     pub changed: bool,
     pub dual: bool,
-    pub laptop: Option<Side>,
-}
-
-impl Arrangement {
-    /// Whether there is anything for the user to choose: the monitor order or the laptop's side.
-    pub fn has_choices(&self) -> bool {
-        self.dual || self.laptop.is_some()
-    }
 }
 
 /// Makes an external display primary and arranges the rest around it (see `plan_layout`).
 pub fn arrange(laptop: Option<Side>, swap_monitors: bool) -> Result<Arrangement> {
-    let mut cfg = active()?;
-    let plan = plan_layout(&cfg.paths, &cfg.modes, laptop, swap_monitors);
-    let (dual, laptop) = (plan.dual, plan.laptop);
-    let unchanged = plan.moves.iter().all(|&(i, x, y)| {
-        let sm = cfg.modes[i].source_mode();
-        sm.x == x && sm.y == y
-    });
-    if unchanged {
-        return Ok(Arrangement { changed: false, dual, laptop });
+    let cfg = active()?;
+    let mut desktop_modes = cfg.modes.clone();
+    for path in cfg.paths.iter().filter(|p| p.flags & PATH_ACTIVE != 0) {
+        let idx = path.source.mode_info_idx as usize;
+        if let Some(m) = cfg.modes.get(idx).filter(|m| m.info_type == MODE_INFO_TYPE_SOURCE) {
+            desktop_modes[idx].set_area(desktop_area(path, m));
+        }
     }
-    for (i, x, y) in plan.moves {
-        cfg.modes[i].set_position(x, y);
+    let plan = plan_layout(&cfg.paths, &desktop_modes, laptop, swap_monitors);
+    let dual = plan.dual;
+    let changes: Vec<_> = plan.moves.iter().filter_map(|&(mode, x, y)| {
+        let before = area(&desktop_modes[mode]);
+        ((before.x, before.y) != (x, y)).then_some(ModeChange {
+            mode, area: Area { x, y, ..before }, rotation: None,
+        })
+    }).collect();
+    if changes.is_empty() {
+        return Ok(Arrangement { changed: false, dual });
     }
-    check(
-        unsafe {
-            SetDisplayConfig(
-                cfg.paths.len() as u32,
-                cfg.paths.as_ptr(),
-                cfg.modes.len() as u32,
-                cfg.modes.as_ptr(),
-                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES,
-            )
-        },
-        "SetDisplayConfig (arrange)",
-    )?;
-    Ok(Arrangement { changed: true, dual, laptop })
+    apply_layout_changes(cfg, &changes)?;
+    Ok(Arrangement { changed: true, dual })
+}
+
+/// Saves the preview's desktop positions and rotations, keeping the other mode settings intact.
+pub fn apply_positions(original: &[Screen], proposed: &[Screen]) -> Result<()> {
+    let cfg = active()?;
+    let current = query_screens(&cfg, false);
+    if current.len() != cfg.paths.iter().filter(|p| p.flags & PATH_ACTIVE != 0).count() {
+        return Err("The active display configuration changed while the preview was open.".into());
+    }
+    let changes = position_changes(&current, original, proposed)?;
+    if changes.is_empty() {
+        return Ok(());
+    }
+    apply_layout_changes(cfg, &changes)
+}
+
+fn apply_layout_changes(mut cfg: Config, changes: &[ModeChange]) -> Result<()> {
+    if let Some(result) = placement::try_apply(&cfg, changes) {
+        return result;
+    }
+
+    // This keeps the current topology and exact modes for any device that cannot stage a
+    // position-only GDI request.
+    apply_mode_changes(&mut cfg, changes);
+    cfg.set(SDC_VALIDATE | SDC_USE_SUPPLIED_DISPLAY_CONFIG, "SetDisplayConfig (validate layout)")?;
+    cfg.apply(0, "SetDisplayConfig (save layout)")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ModeChange {
+    mode: usize,
+    area: Area,
+    rotation: Option<Rotation>,
+}
+
+fn apply_mode_changes(cfg: &mut Config, changes: &[ModeChange]) {
+    for change in changes {
+        // Keep the source surface and target timing intact. The desktop size changes with the
+        // path's rotation without changing either mode's raw size.
+        cfg.modes[change.mode].set_position(change.area.x, change.area.y);
+        if let Some(rotation) = change.rotation {
+            for path in cfg.paths.iter_mut().filter(|p| {
+                p.flags & PATH_ACTIVE != 0 && p.source.mode_info_idx as usize == change.mode
+            }) {
+                path.target.rotation = rotation as u32;
+            }
+        }
+    }
+}
+
+fn position_changes(current: &[(usize, Screen)], original: &[Screen], proposed: &[Screen]) -> Result<Vec<ModeChange>> {
+    let changed = || "The active display configuration changed while the preview was open.".to_string();
+    let invalid = || "The preview layout is invalid.".to_string();
+    if current.len() != original.len() || current.len() != proposed.len() {
+        return Err(changed());
+    }
+    if proposed.iter().filter(|s| s.primary).count() != 1
+        || !valid_layout(&proposed.iter().map(Screen::area).collect::<Vec<_>>())
+    {
+        return Err(invalid());
+    }
+    let mut seen = HashSet::new();
+    let mut moves = Vec::new();
+    for (idx, active) in current {
+        if !seen.insert(&active.id) {
+            return Err(changed());
+        }
+        let before = original.iter().find(|s| s.id == active.id).ok_or_else(changed)?;
+        if active.area() != before.area() || active.primary != before.primary || active.rotation != before.rotation {
+            return Err(changed());
+        }
+        let after = proposed.iter().find(|s| s.id == active.id).ok_or_else(invalid)?;
+        let size = if after.rotation.swaps_axes() == active.rotation.swaps_axes() {
+            (active.width, active.height)
+        } else {
+            (active.height, active.width)
+        };
+        if (after.width, after.height) != size || after.primary != (after.x == 0 && after.y == 0)
+        {
+            return Err(invalid());
+        }
+        let rotation = (after.rotation != active.rotation).then_some(after.rotation);
+        if after.area() != active.area() || rotation.is_some() {
+            moves.push(ModeChange { mode: *idx, area: after.area(), rotation });
+        }
+    }
+    Ok(moves)
 }
 
 /// One desktop area as the user sees it. Duplicated monitors share one entry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Screen {
-    /// Stable while the screen exists (Windows' \\.\DISPLAYn name); names can repeat.
+    /// Target device path, falling back to the display configuration's target identifier.
     pub id: String,
     pub name: String,
     pub internal: bool,
@@ -444,6 +647,8 @@ pub struct Screen {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    pub rotation: Rotation,
+    pub scale: Option<Scale>,
     /// Physical size of the visible picture in millimetres (width, height), from the monitor's EDID.
     pub mm: Option<(f32, f32)>,
 }
@@ -456,33 +661,54 @@ impl Screen {
 
 pub fn screens() -> Result<Vec<Screen>> {
     let cfg = active()?;
+    Ok(screens_with_modes(&cfg).into_iter().map(|(_, s)| s).collect())
+}
+
+fn screens_with_modes(cfg: &Config) -> Vec<(usize, Screen)> {
+    query_screens(cfg, true)
+}
+
+fn query_screens(cfg: &Config, read_panel_settings: bool) -> Vec<(usize, Screen)> {
     let mut out: Vec<(usize, Screen)> = Vec::new();
     for p in cfg.paths.iter().filter(|p| p.flags & PATH_ACTIVE != 0) {
         let idx = p.source.mode_info_idx as usize;
         let Some(m) = cfg.modes.get(idx).filter(|m| m.info_type == MODE_INFO_TYPE_SOURCE) else { continue };
-        let sm = m.source_mode();
-        let name = if p.is_internal() { String::from("Laptop") } else { monitor_name(p) };
+        let desktop = desktop_area(p, m);
+        let target = target_name(p);
+        let name = if p.is_internal() { String::from("Laptop") } else { friendly_name(target.as_ref()) };
         if let Some((_, s)) = out.iter_mut().find(|(i, _)| *i == idx) {
             s.name = format!("{} + {}", s.name, name);
             s.internal &= p.is_internal();
             continue;
         }
+        let device_path = target.map(|t| from_wide(&t.device_path)).unwrap_or_default();
         out.push((
             idx,
             Screen {
-                id: gdi_name(p),
+                id: target_id(p, &device_path),
                 name,
                 internal: p.is_internal(),
-                primary: sm.x == 0 && sm.y == 0,
-                x: sm.x,
-                y: sm.y,
-                width: sm.width as i32,
-                height: sm.height as i32,
-                mm: target_name(p).and_then(|t| physical_size(&from_wide(&t.device_path))),
+                primary: desktop.x == 0 && desktop.y == 0,
+                x: desktop.x,
+                y: desktop.y,
+                width: desktop.w,
+                height: desktop.h,
+                rotation: p.rotation(),
+                scale: if read_panel_settings { scale(p).ok() } else { None },
+                mm: if read_panel_settings { physical_size(&device_path) } else { None },
             },
         ));
     }
-    Ok(out.into_iter().map(|(_, s)| s).collect())
+    out
+}
+
+fn target_id(p: &PathInfo, device_path: &str) -> String {
+    if device_path.is_empty() {
+        let adapter = p.target.adapter_id;
+        format!("{}:{}:{}", adapter.high, adapter.low, p.target.id)
+    } else {
+        device_path.to_lowercase()
+    }
 }
 
 /// The picture size in millimetres from the monitor's EDID, which Windows keeps in the registry
@@ -527,6 +753,7 @@ fn edid_size(edid: &[u8]) -> Option<(f32, f32)> {
     (w_cm > 0 && h_cm > 0).then_some((w_cm as f32 * 10.0, h_cm as f32 * 10.0))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Scale {
     pub current: u32,
     pub recommended: u32,
@@ -535,6 +762,10 @@ pub struct Scale {
 }
 
 impl Scale {
+    pub fn sample(current: u32) -> Self {
+        Self { current, recommended: SCALES[0], min_rel: 0, max_rel: SCALES.len() as i32 - 1 }
+    }
+
     fn from_packet(d: &DpiGet) -> Scale {
         let rec = (-d.min_rel).max(0) as usize;
         let cur = (rec as i32 + d.cur_rel).clamp(0, SCALES.len() as i32 - 1) as usize;
@@ -555,6 +786,19 @@ impl Scale {
         }
         Ok(rel)
     }
+
+    fn for_4k_baseline(&self, baseline: u32, desktop: Area) -> Result<u32> {
+        const SHORT_SIDE_4K: u32 = 2160;
+        let short_side = desktop.w.min(desktop.h);
+        let short_side = if short_side > 0 { short_side as u32 } else { SHORT_SIDE_4K };
+        // Compare exact distances before dividing by 2160. SCALES is in ascending order,
+        // so a tie picks the lower step.
+        let desired = u64::from(baseline) * u64::from(short_side);
+        SCALES.into_iter()
+            .filter(|&step| self.relative_for(step).is_ok())
+            .min_by_key(|&step| (u64::from(step) * u64::from(SHORT_SIDE_4K)).abs_diff(desired))
+            .ok_or_else(|| "Windows did not report a supported display scale.".into())
+    }
 }
 
 pub fn scale(p: &PathInfo) -> Result<Scale> {
@@ -563,26 +807,44 @@ pub fn scale(p: &PathInfo) -> Result<Scale> {
     Ok(Scale::from_packet(&d))
 }
 
-/// Sets every laptop screen (`internal`) or every external monitor to `percent`. Returns how many
-/// were changed.
-pub fn scale_screens(internal: bool, percent: u32) -> Result<usize> {
+/// Applies a literal scale to laptop screens or a resolution-adjusted 4K baseline to external
+/// monitors. Returns the name and applied scale of each changed display.
+pub fn scale_screens(internal: bool, configured_percent: u32) -> Result<Vec<(String, u32)>> {
     let cfg = active()?;
-    let mut changed = 0;
+    let mut changes = Vec::new();
     let mut done = Vec::new();
-    for p in cfg.paths.iter().filter(|p| p.is_internal() == internal) {
+    for p in cfg.paths.iter().filter(|p| p.flags & PATH_ACTIVE != 0 && p.is_internal() == internal) {
         if done.contains(&p.source_key()) {
             continue;
         }
         done.push(p.source_key());
         let s = scale(p)?;
-        if s.current == percent {
-            continue;
+        let percent = if internal {
+            configured_percent
+        } else {
+            let desktop = cfg.modes.get(p.source.mode_info_idx as usize)
+                .filter(|m| m.info_type == MODE_INFO_TYPE_SOURCE)
+                .map_or_else(Area::default, |m| desktop_area(p, m));
+            s.for_4k_baseline(configured_percent, desktop)?
+        };
+        if s.current != percent {
+            changes.push((p, percent, s.relative_for(percent)?));
         }
-        let packet = DpiSet { header: header::<DpiSet>(SET_DPI_SCALE, p.source.adapter_id, p.source.id), rel: s.relative_for(percent)? };
-        check(unsafe { DisplayConfigSetDeviceInfo(&packet.header) }, "set DPI scale")?;
-        changed += 1;
+    }
+
+    let mut changed = Vec::new();
+    for (p, percent, relative) in changes {
+        set_relative_scale(p, relative)?;
+        let name = monitor_name(p);
+        let name = if name.is_empty() || name == "(unknown)" { gdi_name(p) } else { name };
+        changed.push((name, percent));
     }
     Ok(changed)
+}
+
+fn set_relative_scale(p: &PathInfo, rel: i32) -> Result<()> {
+    let packet = DpiSet { header: header::<DpiSet>(SET_DPI_SCALE, p.source.adapter_id, p.source.id), rel };
+    check(unsafe { DisplayConfigSetDeviceInfo(&packet.header) }, "set DPI scale")
 }
 
 fn target_name(p: &PathInfo) -> Option<TargetName> {
@@ -600,9 +862,12 @@ fn target_name(p: &PathInfo) -> Option<TargetName> {
 }
 
 pub fn monitor_name(p: &PathInfo) -> String {
-    let Some(t) = target_name(p) else { return String::from("(unknown)") };
-    let name = from_wide(&t.friendly_name);
+    let name = friendly_name(target_name(p).as_ref());
     if name.is_empty() && p.is_internal() { String::from("Built-in screen") } else { name }
+}
+
+fn friendly_name(target: Option<&TargetName>) -> String {
+    target.map_or_else(|| String::from("(unknown)"), |t| from_wide(&t.friendly_name))
 }
 
 pub fn gdi_name(p: &PathInfo) -> String {
@@ -757,6 +1022,107 @@ mod tests {
     }
 
     #[test]
+    fn custom_layout_keeps_the_portrait_geometry_and_uses_current_mode_indices() {
+        let main = Screen {
+            id: "main".into(), name: "Display".into(), internal: false, primary: true,
+            x: 0, y: 0, width: 2560, height: 1440, rotation: Rotation::Landscape, scale: None, mm: None,
+        };
+        let portrait = Screen {
+            id: "portrait".into(), name: "Display".into(), internal: false, primary: false,
+            x: -1440, y: -200, width: 1440, height: 2560, rotation: Rotation::Portrait, scale: None, mm: None,
+        };
+        let current = [(7, portrait.clone()), (3, main.clone())];
+        let original = [main.clone(), portrait.clone()];
+        let mut proposed = [main, Screen { x: 300, y: -2560, ..portrait }];
+        assert_eq!(
+            position_changes(&current, &original, &proposed).unwrap(),
+            vec![ModeChange { mode: 7, area: proposed[1].area(), rotation: None }],
+        );
+
+        proposed[1].y -= 1;
+        assert!(position_changes(&current, &original, &proposed).is_err());
+        proposed[1].y += 2;
+        assert!(position_changes(&current, &original, &proposed).is_err());
+    }
+
+    #[test]
+    fn custom_layout_rejects_a_replaced_or_rotated_display() {
+        let main = Screen {
+            id: "main".into(), name: "Display".into(), internal: false, primary: true,
+            x: 0, y: 0, width: 2560, height: 1440, rotation: Rotation::Landscape, scale: None, mm: None,
+        };
+        let secondary = Screen {
+            id: "secondary".into(), name: "Display".into(), internal: false, primary: false,
+            x: 2560, y: 0, width: 2560, height: 1440, rotation: Rotation::Landscape, scale: None, mm: None,
+        };
+        let original = [main.clone(), secondary.clone()];
+        let proposed = [main.clone(), Screen { y: 200, ..secondary.clone() }];
+        let replacement = Screen { id: "replacement".into(), ..secondary.clone() };
+        let rotated = Screen { rotation: Rotation::LandscapeFlipped, ..secondary };
+        for changed in [replacement, rotated] {
+            let current = [(3, main.clone()), (7, changed)];
+            assert!(position_changes(&current, &original, &proposed).is_err());
+        }
+    }
+
+    #[test]
+    fn custom_layout_can_rebase_to_a_different_primary_display() {
+        let main = Screen {
+            id: "main".into(), name: "Display".into(), internal: false, primary: true,
+            x: 0, y: 0, width: 1920, height: 1080, rotation: Rotation::Landscape, scale: None, mm: None,
+        };
+        let other = Screen {
+            id: "other".into(), name: "Display".into(), internal: false, primary: false,
+            x: 1920, y: 250, width: 1440, height: 2560, rotation: Rotation::Portrait, scale: None, mm: None,
+        };
+        let original = [main.clone(), other.clone()];
+        let current = [(1, main.clone()), (2, other.clone())];
+        let mut proposed = [
+            Screen { x: -1920, y: -250, primary: false, ..main },
+            Screen { x: 0, y: 0, primary: true, ..other },
+        ];
+        let changes = position_changes(&current, &original, &proposed).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].area, proposed[0].area());
+        assert_eq!(changes[1].area, proposed[1].area());
+        assert!(changes.iter().all(|change| change.rotation.is_none()));
+
+        proposed[0].primary = true;
+        assert!(position_changes(&current, &original, &proposed).is_err());
+        proposed[1].primary = false;
+        assert!(position_changes(&current, &original, &proposed).is_err());
+    }
+
+    #[test]
+    fn custom_rotation_preserves_the_raw_source_size() {
+        let main = Screen {
+            id: "main".into(), name: "Display".into(), internal: false, primary: true,
+            x: 0, y: 0, width: 1920, height: 1080, rotation: Rotation::Landscape, scale: None, mm: None,
+        };
+        let external = Screen {
+            id: "external".into(), name: "Display".into(), internal: false, primary: false,
+            x: 1920, y: 0, width: 2560, height: 1440, rotation: Rotation::Landscape, scale: None, mm: None,
+        };
+        let current = [(0, main.clone()), (1, external.clone())];
+        let original = [main.clone(), external.clone()];
+        let mut proposed = [main, Screen { rotation: Rotation::PortraitFlipped, ..external }];
+        assert!(position_changes(&current, &original, &proposed).is_err());
+
+        (proposed[1].width, proposed[1].height) = (1440, 2560);
+        proposed[1].y = 300;
+        let changes = position_changes(&current, &original, &proposed).unwrap();
+        let mut cfg = Config {
+            paths: vec![path(0, 5, false), path(1, 6, false)],
+            modes: vec![mode(1920, 1080, 0, 0), mode(2560, 1440, 1920, 0)],
+        };
+        apply_mode_changes(&mut cfg, &changes);
+        assert_eq!(area(&cfg.modes[1]), Area { y: 300, ..original[1].area() });
+        assert_eq!(cfg.paths[1].rotation(), Rotation::PortraitFlipped);
+        assert_eq!(area(&cfg.modes[0]), original[0].area());
+        assert_eq!(cfg.paths[0].rotation(), Rotation::Landscape);
+    }
+
+    #[test]
     fn reads_size_from_edid() {
         let mut edid = [0u8; 128];
         edid[21] = 93;
@@ -778,5 +1144,33 @@ mod tests {
         assert_eq!(s.relative_for(150).unwrap(), 0);
         assert_eq!(s.relative_for(100).unwrap(), -2);
         assert!(s.relative_for(300).is_err());
+    }
+
+    #[test]
+    fn external_scaling_uses_the_shorter_side_in_any_orientation() {
+        let scale = Scale::sample(150);
+        for (w, h, expected) in [
+            (3840, 2160, 150),
+            (2160, 3840, 150),
+            (5120, 2160, 150),
+            (2560, 1440, 100),
+            (3440, 1440, 100),
+            (1080, 1920, 100),
+            (7680, 4320, 300),
+        ] {
+            let desktop = Area { w, h, ..Default::default() };
+            assert_eq!(scale.for_4k_baseline(150, desktop).unwrap(), expected, "{w}×{h}");
+        }
+    }
+
+    #[test]
+    fn external_scaling_rounds_to_the_nearest_allowed_step() {
+        let scale = Scale::from_packet(&DpiGet { min_rel: -1, max_rel: 1, ..Default::default() });
+        let hd = Area { w: 1920, h: 1080, ..Default::default() };
+        let qhd = Area { w: 2560, h: 1440, ..Default::default() };
+        let uhd = Area { w: 3840, h: 2160, ..Default::default() };
+        assert_eq!(scale.for_4k_baseline(225, hd).unwrap(), 100); // Tied between 100 and 125.
+        assert_eq!(scale.for_4k_baseline(200, qhd).unwrap(), 125);
+        assert_eq!(scale.for_4k_baseline(300, uhd).unwrap(), 150); // Largest supported step.
     }
 }
