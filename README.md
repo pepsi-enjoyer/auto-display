@@ -14,8 +14,7 @@
 </div>
 
 <p align="center">
-  <img src="docs/card.png" alt="Display Preview with one ultrawide monitor and laptop" width="49%">
-  <img src="docs/card-dual.png" alt="Display Preview with two 27-inch monitors and laptop" width="49%">
+  <img src="docs/preview-demo.gif" alt="Interactive Display Preview demo: dragging displays, detached warning, snapping, and right-clicking to set scaling and main display" width="584">
 </p>
 
 ## Quick Install
@@ -71,7 +70,8 @@ When Windows has no saved layout for the connected screens, `auto-display` uses 
 - **Two external monitors:** Side by side with the right monitor as main, laptop centered below.
 
 <p align="center">
-  <img src="docs/card-portrait.png" alt="Display Preview with a portrait 27-inch monitor, landscape 27-inch monitor, and laptop" width="56%">
+  <img src="docs/card.png" alt="Display Preview with one ultrawide monitor and laptop" width="49%">
+  <img src="docs/card-portrait.png" alt="Display Preview with a portrait 27-inch monitor, landscape 27-inch monitor, and laptop" width="49%">
 </p>
 
 > [!TIP]
