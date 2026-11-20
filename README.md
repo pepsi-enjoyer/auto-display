@@ -1,95 +1,114 @@
-# auto-display
+<div align="center">
+  <img src="docs/icon.svg" alt="auto-display icon" width="72" height="72">
+  <h1>auto-display</h1>
+  <p><strong>Stop Windows laptops from duplicating screens when you dock.</strong><br>
+  Automatically switches to extend, restores your layout and DPI scaling, and gives you a to-scale preview card.</p>
 
-Dock your Windows laptop and the screens come up duplicated? auto-display fixes that. It:
+  <p>
+    <a href="https://github.com/pepsi-enjoyer/auto-display/releases/latest">
+      <img src="https://img.shields.io/github/v/release/pepsi-enjoyer/auto-display?style=flat-square&color=3d7eea&label=release" alt="Latest release">
+    </a>
+    <img src="https://img.shields.io/badge/platform-Windows%20x64-1b1c1f?style=flat-square" alt="Windows x64">
+    <img src="https://img.shields.io/badge/built%20with-Rust-1b1c1f?style=flat-square" alt="Built with Rust">
+  </p>
+</div>
 
-- switches to extend
-- restores the layout and scaling Windows remembers for those displays
-- applies its placement and scaling defaults when Windows has no saved setup
+<p align="center">
+  <img src="docs/card.png" alt="Display Preview with one ultrawide monitor and laptop" width="49%">
+  <img src="docs/card-dual.png" alt="Display Preview with two 27-inch monitors and laptop" width="49%">
+</p>
 
-It runs at sign-in and whenever you plug in a monitor. The first time it sees more than one screen
-after you start your PC, it sets them up and shows the card below, duplicated or not. After that it
-only steps in, without the card, when plugging in a monitor leaves the screens duplicated. If you
-switch to duplicate yourself later, for example to present, it leaves you alone.
+## Quick Install
 
-Windows does not redraw the taskbar properly when the scaling changes, so auto-display restarts
-Explorer after changing it. This closes open File Explorer windows.
-
-## Layout
-
-When Windows has a layout for the connected displays, the preview opens with that layout and the
-saved scaling. The automatic layout defaults are:
-
-- **One monitor:** the laptop sits to its left.
-- **Two monitors:** side by side, with the right one as the main display and the laptop centred below.
-
-The **Display Preview** card draws each display to scale using its reported physical dimensions. Drag a
-display to move it. Right-click a tile to choose the main display or change that display's scaling.
-Scaling changes apply immediately. Detached displays turn red until you reconnect them, and
-**Keep** saves the arrangement once all displays are connected. **Revert** restores the settings
-from before setup. If you leave the preview alone, it keeps the setup after 10 seconds.
-
-## Install
-
-Run this in PowerShell on 64-bit Windows:
+Run in PowerShell on 64-bit Windows (no admin rights or Rust required):
 
 ```powershell
 irm https://raw.githubusercontent.com/pepsi-enjoyer/auto-display/master/install.ps1 | iex
 ```
 
-This downloads the [latest release](https://github.com/pepsi-enjoyer/auto-display/releases/latest),
-checks its SHA-256 checksum, installs it to `%LOCALAPPDATA%\auto-display`, and adds it to your user
-PATH. It starts now and at every sign-in. No Rust or admin rights are needed. Run the same command
-again to update; your settings are kept. Once installed, it checks for updates after one minute and
-every six hours, verifies the download, and restarts itself without changing your current display layout.
+Downloads the [latest release](https://github.com/pepsi-enjoyer/auto-display/releases/latest), verifies its SHA-256 checksum, installs to `%LOCALAPPDATA%\auto-display`, adds `auto-display` to your user `PATH`, and starts the background watcher now and at sign-in. Run the same command again to update without losing your settings.
 
-You can also download `auto-display.exe` from the release and run `.\auto-display.exe install`,
-then reopen PowerShell to pick up the PATH change.
+<details>
+<summary>Other installation methods (manual download or Cargo)</summary>
 
-Or build and install with [Rust](https://rustup.rs):
+- **Manual download:** Grab `auto-display.exe` from [Releases](https://github.com/pepsi-enjoyer/auto-display/releases/latest), run `.\auto-display.exe install`, then reopen PowerShell to pick up the `PATH` change.
+- **Build from source with [Rust](https://rustup.rs):**
+  ```powershell
+  cargo install --git https://github.com/pepsi-enjoyer/auto-display --locked
+  auto-display install
+  ```
 
-```powershell
-cargo install --git https://github.com/pepsi-enjoyer/auto-display --locked
-auto-display install
-```
+</details>
 
-## Run it yourself
+## How It Works
 
-Once installed, you can set up your screens and bring up the card whenever you like:
+<p align="center">
+  <img src="docs/how-it-works.svg" alt="How auto-display works: Dock or Sign In, Extend and Restore, Preview and Keep" width="100%">
+</p>
 
-```powershell
-auto-display
-```
+- **First multi-screen setup after boot:** Arranges your displays and opens the Display Preview card on every screen, duplicated or not.
+- **Later docks:** Silently switches back to extend if plugging in a monitor leaves displays duplicated (no card).
+- **Manual duplicate mode:** If you switch to Duplicate yourself later (for example, to present), `auto-display` leaves it alone.
+- **Auto-updates:** Checks GitHub 1 minute after sign-in and every 6 hours, verifies the download, and restarts the watcher without changing your layout.
 
-If you installed an older version, rerun the installer once to add it to your PATH.
+> [!NOTE]
+> Windows does not redraw the taskbar properly after a DPI scaling change, so `auto-display` restarts Explorer when scaling changes. This closes open File Explorer windows. Set `restart_explorer = false` in `config.toml` to disable it.
 
-## Settings
+## Display Preview
 
-`auto-display config` prints where the settings file is
-(`%LOCALAPPDATA%\auto-display\config.toml`):
+The card draws each screen to scale from its reported physical dimensions — including mixed orientations and portrait monitors.
+
+| Control | Action |
+|---|---|
+| **Drag a tile** | Slide displays along edges and into corners; detached tiles turn red until reconnected |
+| **Right-click a tile** | Set as **Main display** or adjust **Scaling** (scaling applies immediately) |
+| **Keep** / `Enter` | Save the layout (auto-keeps after 10 seconds if untouched) |
+| **Revert** / `Esc` | Restore the layout and scaling from before setup |
+
+When Windows has no saved layout for the connected screens, `auto-display` uses sensible defaults:
+
+- **One external monitor:** External monitor as main, laptop on its left.
+- **Two external monitors:** Side by side with the right monitor as main, laptop centered below.
+
+<p align="center">
+  <img src="docs/card-portrait.png" alt="Display Preview with a portrait 27-inch monitor, landscape 27-inch monitor, and laptop" width="56%">
+</p>
+
+> [!TIP]
+> Run `auto-display` anytime to open the preview card for your current screens, or `auto-display preview dual` (also `portrait`, `single`, `done`, `error`) to try it without changing anything.
+
+## Configuration
+
+Run `auto-display config` to create and print the path to your settings file (`%LOCALAPPDATA%\auto-display\config.toml`):
 
 ```toml
-external_scale = 150   # scaling for a 4K external monitor, in percent
-# laptop_scale = 250   # scaling for the laptop screen; leave out to keep what Windows chose
-auto_update = true    # set to false to turn off automatic updates
-restart_explorer = true   # set to false to leave Explorer alone after a scaling change
+external_scale = 150      # scaling for a 4K external monitor (%)
+# laptop_scale = 250      # scaling for the laptop screen; omit to keep Windows' choice
+auto_update = true        # set to false to disable automatic updates
+restart_explorer = true   # set to false to keep Explorer running after scaling changes
 ```
 
-External monitors scale in proportion to their resolution's shorter side, using 2160 pixels as
-the 4K baseline. Auto-display picks the nearest Windows-supported percentage. A setting of 150%
-gives 100% on both 1440p and 1080p monitors.
+External monitors scale proportionally by their shorter pixel edge (2160 px = 4K baseline), rounded to the nearest Windows scaling step:
+
+| Monitor Resolution | Short Edge | Applied Scale (at `external_scale = 150`) |
+|---|---:|---:|
+| 4K / 5K2K (`3840x2160`, `5120x2160`, `2160x3840`) | 2160 px | **150%** |
+| 1440p (`2560x1440`) | 1440 px | **100%** |
+| 1080p (`1920x1080`) | 1080 px | **100%** |
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| (none) | Set up your screens now and show the card, whether or not they are duplicated |
-| `status` | Show your screens, their sizes, and whether auto-display is running |
-| `update` | Check for and install a newer release now |
-| `laptop left\|right\|below` | Move the laptop screen |
-| `swap` | Swap two monitors |
-| `layout` | Apply the layout and scaling now, without the card |
-| `taskbar` | Restart Explorer if the taskbar is the wrong size |
-| `preview` | Show the card with example screens (`dual`, `portrait`, `single`, `done`, `error`), without changing anything |
-| `uninstall` | Stop it and remove it from sign-in and your user PATH |
+| `auto-display` | Set up displays now and show the Display Preview card |
+| `auto-display status` | Show connected displays, physical sizes, scaling, and watcher status |
+| `auto-display layout` | Apply layout and scaling now without showing the card |
+| `auto-display laptop left\|right\|below` | Move the laptop screen relative to external monitors |
+| `auto-display swap` | Swap two side-by-side external monitors |
+| `auto-display taskbar` | Restart Explorer so the taskbar matches the current scaling |
+| `auto-display config` | Create `config.toml` if needed and print its path |
+| `auto-display update` | Check for and install a newer GitHub release now |
+| `auto-display preview [kind]` | Demo the card (`dual`, `portrait`, `single`, `done`, `error`) safely |
+| `auto-display uninstall` | Stop the watcher and remove it from sign-in and your user `PATH` |
 
-The log is at `%LOCALAPPDATA%\auto-display\auto-display.log`.
+Logs are written to `%LOCALAPPDATA%\auto-display\auto-display.log`.

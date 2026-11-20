@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="186" viewBox="0 0 840 186" fill="none">
+  <style>
+    .step-num { font: 600 11px "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; letter-spacing: 0.06em; }
+    .title { font: 600 15px "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; fill: #f2f3f5; }
+    .body { font: 400 12.5px "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; fill: #9397a1; }
+  </style>
+
+  <!-- Outer card -->
+  <rect x="0.75" y="0.75" width="838.5" height="184.5" rx="14" fill="#1b1c1f" stroke="#353842" stroke-width="1.5"/>
+
+  <!-- Step 1 -->
+  <rect x="20" y="20" width="240" height="146" rx="10" fill="#151618" stroke="#2a2d34" stroke-width="1"/>
+  <rect x="36" y="36" width="38" height="38" rx="10" fill="#3d7eea" fill-opacity="0.16"/>
+  <!-- Display plug icon -->
+  <rect x="44" y="45" width="22" height="14" rx="2.5" stroke="#8ab4f8" stroke-width="1.8"/>
+  <line x1="55" y1="59" x2="55" y2="64" stroke="#8ab4f8" stroke-width="1.8" stroke-linecap="round"/>
+  <line x1="50" y1="64" x2="60" y2="64" stroke="#8ab4f8" stroke-width="1.8" stroke-linecap="round"/>
+  <rect x="206" y="44" width="38" height="20" rx="10" fill="#232732"/>
+  <text x="225" y="58" text-anchor="middle" class="step-num" fill="#8ab4f8">01</text>
+  <text x="36" y="102" class="title">Dock or Sign In</text>
+  <text x="36" y="124" class="body">Watches for monitor changes</text>
+  <text x="36" y="142" class="body">and first multi-screen boot.</text>
+
+  <!-- Arrow 1 -> 2 -->
+  <line x1="270" y1="93" x2="290" y2="93" stroke="#474a52" stroke-width="2" stroke-linecap="round"/>
+  <polyline points="285,87 291,93 285,99" fill="none" stroke="#474a52" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Step 2 -->
+  <rect x="300" y="20" width="240" height="146" rx="10" fill="#151618" stroke="#2a2d34" stroke-width="1"/>
+  <rect x="316" y="36" width="38" height="38" rx="10" fill="#3d7eea" fill-opacity="0.16"/>
+  <!-- Extend layout icon -->
+  <rect x="323" y="51" width="9" height="8" rx="1.5" stroke="#8ab4f8" stroke-width="1.7"/>
+  <rect x="335" y="46" width="13" height="13" rx="2" fill="#3d7eea" fill-opacity="0.24" stroke="#8ab4f8" stroke-width="1.7"/>
+  <line x1="322" y1="62.5" x2="333" y2="62.5" stroke="#8ab4f8" stroke-width="1.6" stroke-linecap="round"/>
+  <rect x="486" y="44" width="38" height="20" rx="10" fill="#232732"/>
+  <text x="505" y="58" text-anchor="middle" class="step-num" fill="#8ab4f8">02</text>
+  <text x="316" y="102" class="title">Extend &amp; Restore</text>
+  <text x="316" y="124" class="body">Exits duplicate mode, restores</text>
+  <text x="316" y="142" class="body">saved layout or smart defaults.</text>
+
+  <!-- Arrow 2 -> 3 -->
+  <line x1="550" y1="93" x2="570" y2="93" stroke="#474a52" stroke-width="2" stroke-linecap="round"/>
+  <polyline points="565,87 571,93 565,99" fill="none" stroke="#474a52" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Step 3 -->
+  <rect x="580" y="20" width="240" height="146" rx="10" fill="#151618" stroke="#2a2d34" stroke-width="1"/>
+  <rect x="596" y="36" width="38" height="38" rx="10" fill="#4cc38a" fill-opacity="0.16"/>
+  <!-- Check icon -->
+  <polyline points="607,55.5 612.5,61 623.5,49.5" fill="none" stroke="#4cc38a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="766" y="44" width="38" height="20" rx="10" fill="#1d2c27"/>
+  <text x="785" y="58" text-anchor="middle" class="step-num" fill="#4cc38a">03</text>
+  <text x="596" y="102" class="title">Preview &amp; Keep</text>
+  <text x="596" y="124" class="body">Drag tiles or right-click to adjust;</text>
+  <text x="596" y="142" class="body">auto-keeps after 10 seconds.</text>
+</svg>
