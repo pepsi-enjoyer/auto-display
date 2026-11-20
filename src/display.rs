@@ -356,35 +356,51 @@ pub struct Area {
     pub h: i32,
 }
 
-/// The desktop must form a connected set of screens with no overlapping interiors.
-pub fn valid_layout(areas: &[Area]) -> bool {
-    if areas.is_empty() || areas.iter().any(|area| area.w <= 0 || area.h <= 0) {
-        return false;
+impl Area {
+    fn intersection(self, other: Self) -> (i64, i64) {
+        let extent = |a: i32, a_len: i32, b: i32, b_len: i32| {
+            (i64::from(a) + i64::from(a_len)).min(i64::from(b) + i64::from(b_len)) - i64::from(a.max(b))
+        };
+        (extent(self.x, self.w, other.x, other.w), extent(self.y, self.h, other.y, other.h))
     }
+
+    pub fn overlaps(self, other: Self) -> bool {
+        let (x, y) = self.intersection(other);
+        x > 0 && y > 0
+    }
+}
+
+/// Which areas can reach the starting one by crossing shared edges.
+pub fn connected_to(areas: &[Area], start: usize) -> Vec<bool> {
     let mut connected = vec![false; areas.len()];
-    let mut pending = vec![0];
-    connected[0] = true;
+    let Some(first) = connected.get_mut(start) else { return connected };
+    *first = true;
+    let mut pending = vec![start];
     while let Some(i) = pending.pop() {
         let a = areas[i];
         for (j, &b) in areas.iter().enumerate() {
-            if i == j {
+            if connected[j] {
                 continue;
             }
-            let extent = |a: i32, a_len: i32, b: i32, b_len: i32| {
-                (i64::from(a) + i64::from(a_len)).min(i64::from(b) + i64::from(b_len)) - i64::from(a.max(b))
-            };
-            let x = extent(a.x, a.w, b.x, b.w);
-            let y = extent(a.y, a.h, b.y, b.h);
-            if x > 0 && y > 0 {
-                return false;
-            }
-            if !connected[j] && ((x == 0 && y > 0) || (x > 0 && y == 0)) {
+            let (x, y) = a.intersection(b);
+            if (x == 0 && y > 0) || (x > 0 && y == 0) {
                 connected[j] = true;
                 pending.push(j);
             }
         }
     }
-    connected.into_iter().all(|adjacent| adjacent)
+    connected
+}
+
+/// The desktop must form a connected set of screens with no overlapping interiors.
+pub fn valid_layout(areas: &[Area]) -> bool {
+    if areas.is_empty() || areas.iter().any(|area| area.w <= 0 || area.h <= 0) {
+        return false;
+    }
+    if areas.iter().enumerate().any(|(index, &a)| areas[..index].iter().any(|&b| a.overlaps(b))) {
+        return false;
+    }
+    connected_to(areas, 0).into_iter().all(|attached| attached)
 }
 
 /// Two external monitors, neither ultrawide: they sit side by side and the right one is primary.

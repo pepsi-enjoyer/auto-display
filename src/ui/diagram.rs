@@ -12,6 +12,77 @@ pub(super) fn offset_in_pixels(offset: f32, moving_px: i32, neighbour_px: i32, m
     (offset * pixels.max(1) as f32 / mm).round() as i32
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct SeamSpan {
+    pixels: (i32, i32),
+    mm: (f32, f32),
+}
+
+impl SeamSpan {
+    pub(super) fn pixel_at(self, mm: f32) -> Option<i32> {
+        if !(self.mm.0..=self.mm.1).contains(&mm) {
+            return None;
+        }
+        let fraction = (mm - self.mm.0) / (self.mm.1 - self.mm.0);
+        Some(self.pixels.0 + (fraction * (self.pixels.1 - self.pixels.0) as f32).round() as i32)
+    }
+
+    fn mm_at(self, pixel: i32) -> Option<f32> {
+        if !(self.pixels.0..=self.pixels.1).contains(&pixel) {
+            return None;
+        }
+        let fraction = (pixel - self.pixels.0) as f32 / (self.pixels.1 - self.pixels.0) as f32;
+        Some(self.mm.0 + fraction * (self.mm.1 - self.mm.0))
+    }
+}
+
+/// Map the open part of an edge between the desktop and the diagram. A third panel can cap
+/// the slide at very different offsets because a high-DPI screen takes more room in pixels.
+pub(super) fn constrained_seam(
+    moving: (Area, Rect), anchor: (Area, Rect), panels: &[(Area, Rect)], along_x: bool, from_pixels: bool,
+) -> Option<SeamSpan> {
+    let pixel_axis = |a: Area| if along_x { (a.x, a.w, a.y, a.h) } else { (a.y, a.h, a.x, a.w) };
+    let physical_axis = |r: Rect| {
+        if along_x { (r.left(), r.width(), r.top(), r.height()) } else { (r.top(), r.height(), r.left(), r.width()) }
+    };
+    let (start_px, length_px, cross_px, width_px) = pixel_axis(moving.0);
+    let (start_mm, length_mm, cross_mm, width_mm) = physical_axis(moving.1);
+    let (anchor_px, anchor_length_px, _, _) = pixel_axis(anchor.0);
+    let (anchor_mm, anchor_length_mm, _, _) = physical_axis(anchor.1);
+    let full = SeamSpan {
+        pixels: (anchor_px - length_px + 1, anchor_px + anchor_length_px - 1),
+        mm: (
+            anchor_mm - length_mm + length_mm / length_px as f32,
+            anchor_mm + anchor_length_mm - anchor_length_mm / anchor_length_px as f32,
+        ),
+    };
+    let mut span = full;
+    for &(area, rect) in panels {
+        let (px, len_px, other_px, other_width_px) = pixel_axis(area);
+        let (mm, len_mm, other_mm, other_width_mm) = physical_axis(rect);
+        let crosses_pixels = cross_px + width_px > other_px && other_px + other_width_px > cross_px;
+        let crosses_mm = (cross_mm + width_mm).min(other_mm + other_width_mm) - cross_mm.max(other_mm) > 0.001;
+        if !crosses_pixels || !crosses_mm {
+            continue;
+        }
+        let (before, after) = if from_pixels {
+            (start_px + length_px <= px, start_px >= px + len_px)
+        } else {
+            (start_mm + length_mm <= mm + 0.001, start_mm >= mm + len_mm - 0.001)
+        };
+        if before {
+            span.pixels.1 = span.pixels.1.min(px - length_px);
+            span.mm.1 = span.mm.1.min(mm - length_mm);
+        } else if after {
+            span.pixels.0 = span.pixels.0.max(px + len_px);
+            span.mm.0 = span.mm.0.max(mm + len_mm);
+        } else {
+            return None;
+        }
+    }
+    (span != full && span.pixels.0 < span.pixels.1 && span.mm.0 < span.mm.1).then_some(span)
+}
+
 fn size_mm(screen: &Screen) -> Vec2 {
     if let Some((w, h)) = screen.mm.filter(|&(w, h)| w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
         // EDID describes the panel. The desktop dimensions include its current orientation.
@@ -66,7 +137,7 @@ fn along_edge(a: Area, size: Vec2, b: Area, anchor: Rect) -> Option<(Rect, Seam,
     Some((Rect::from_min_size(pos2(x, y), size), seam, centered))
 }
 
-fn is_clear(rect: Rect, placed: &[(Area, Rect)]) -> bool {
+pub(super) fn is_clear(rect: Rect, placed: &[(Area, Rect)]) -> bool {
     placed.iter().all(|(_, other)| {
         let intersection = rect.intersect(*other);
         intersection.width() <= 0.001 || intersection.height() <= 0.001
@@ -127,14 +198,23 @@ fn slide_along_edge(ideal: Rect, seam: Seam, anchor: Rect, placed: &[(Area, Rect
 fn placement(screen: &Screen, anchors: &[(Area, Rect)], placed: &[(Area, Rect)]) -> Option<Rect> {
     let size = size_mm(screen);
     anchors.iter().filter_map(|&(area, anchor)| {
-        let (ideal, seam, centered) = along_edge(screen.area(), size, area, anchor)?;
+        let moving = screen.area();
+        let (mut ideal, seam, centered) = along_edge(moving, size, area, anchor)?;
+        let horizontal = seam == Seam::Horizontal;
+        if let Some(span) = constrained_seam((moving, ideal), (area, anchor), placed, horizontal, true) {
+            let position = if horizontal { moving.x } else { moving.y };
+            if let Some(mm) = span.mm_at(position) {
+                let delta = if horizontal { vec2(mm - ideal.left(), 0.0) } else { vec2(0.0, mm - ideal.top()) };
+                ideal = ideal.translate(delta);
+            }
+        }
         let rect = slide_along_edge(ideal, seam, anchor, placed)?;
         Some((rect, (rect.min - ideal.min).length_sq(), centered))
     }).min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.2.cmp(&a.2)))
         .map(|(rect, _, _)| rect)
 }
 
-fn nearest_clear_rect(ideal: Rect, placed: &[(Area, Rect)]) -> Rect {
+pub(super) fn nearest_clear_rect(ideal: Rect, placed: &[(Area, Rect)]) -> Rect {
     if is_clear(ideal, placed) {
         return ideal;
     }

@@ -32,7 +32,7 @@ use crate::{config, fix, install, log, watch};
 
 mod diagram;
 mod pointer;
-use diagram::{corner_rect, offset_in_mm, offset_in_pixels, physical_rects};
+use diagram::{constrained_seam, corner_rect, is_clear, nearest_clear_rect, offset_in_mm, offset_in_pixels, physical_rects};
 use pointer::{PointerAnchor, PointerSettlement};
 
 const WIDTH: f32 = 584.0;
@@ -330,7 +330,7 @@ enum Action {
     Keep,
     Revert,
     Close,
-    MoveScreen(usize, i32, i32),
+    MoveScreen { index: usize, position: (i32, i32), rect: Rect },
     SetScale(usize, u32),
     SetMain(usize),
 }
@@ -356,6 +356,12 @@ struct Drag {
     origin_mm: Pos2,
 }
 
+struct LayoutDraft {
+    screens: Vec<Screen>,
+    // Keep stationary tiles in place when a drag breaks their desktop connections.
+    rects: Vec<Rect>,
+}
+
 /// One native window showing the card. The main one is eframe's root window; every other monitor
 /// gets an extra egui viewport.
 #[derive(Default)]
@@ -379,7 +385,7 @@ struct Card {
     preview: Option<Preview>,
     snapshot: Option<Arc<Snapshot>>,
     mock_original: Option<Vec<Screen>>,
-    draft: Option<Vec<Screen>>,
+    draft: Option<LayoutDraft>,
     edit: LayoutEdit,
 }
 
@@ -448,7 +454,7 @@ impl Card {
             Action::Revert => self.revert(ctx),
             Action::Close => self.close(),
             Action::SetScale(index, percent) => self.change_scale(index, percent, ctx),
-            Action::MoveScreen(..) | Action::SetMain(..) => {
+            Action::MoveScreen { .. } | Action::SetMain(..) => {
                 self.edit_layout(action);
                 ctx.request_repaint_of(ViewportId::ROOT);
             }
@@ -460,7 +466,7 @@ impl Card {
             let state = self.state.lock().unwrap();
             (state.screens.clone(), state.needs_taskbar_refresh)
         };
-        let Some(mut screens) = self.draft.clone() else {
+        let Some(draft) = &self.draft else {
             if self.preview.is_none() {
                 log::line("Kept the display settings.");
                 if needs_refresh {
@@ -470,6 +476,10 @@ impl Card {
             set_phase_with(&self.state, ctx, Phase::Kept, None);
             return;
         };
+        if !display::valid_layout(&draft.screens.iter().map(Screen::area).collect::<Vec<_>>()) {
+            return;
+        }
+        let mut screens = draft.screens.clone();
         for (draft, live) in screens.iter_mut().zip(&before) {
             draft.scale = live.scale;
         }
@@ -532,22 +542,26 @@ impl Card {
     fn edit_layout(&mut self, action: Action) {
         self.edit.hold_open = true;
         let state = self.state.lock().unwrap();
-        let mut screens = self.draft.as_deref().unwrap_or(&state.screens).to_vec();
+        let mut draft = self.draft.take().unwrap_or_else(|| LayoutDraft {
+            screens: state.screens.clone(),
+            rects: physical_rects(&state.screens),
+        });
         match action {
-            Action::MoveScreen(index, x, y) => {
-                (screens[index].x, screens[index].y) = (x, y);
+            Action::MoveScreen { index, position, rect } => {
+                (draft.screens[index].x, draft.screens[index].y) = position;
+                draft.rects[index] = rect;
             }
             Action::SetMain(index) => {
-                for (i, screen) in screens.iter_mut().enumerate() {
+                for (i, screen) in draft.screens.iter_mut().enumerate() {
                     screen.primary = i == index;
                 }
             }
             _ => unreachable!(),
         }
-        anchor_primary(&mut screens);
-        self.draft = screens.iter().zip(&state.screens)
+        anchor_primary(&mut draft.screens);
+        self.draft = draft.screens.iter().zip(&state.screens)
             .any(|(screen, current)| screen.area() != current.area() || screen.primary != current.primary)
-            .then_some(screens);
+            .then_some(draft);
     }
 
     fn change_scale(&mut self, index: usize, percent: u32, ctx: &egui::Context) {
@@ -680,15 +694,16 @@ impl eframe::App for Card {
         let ctx = ui.ctx().clone();
         let here: Vec<Option<String>> =
             (0..self.monitors.len().max(1)).map(|m| self.screen_under(&screens, m)).collect();
-        let preview = if let Some(draft) = self.draft.as_mut() && matches!(phase, Phase::Prompt | Phase::Applying) {
-            for (screen, actual) in draft.iter_mut().zip(&screens) {
+        let (preview, rects) = if let Some(draft) = &self.draft && matches!(phase, Phase::Prompt | Phase::Applying) {
+            let mut preview = draft.screens.clone();
+            for (screen, actual) in preview.iter_mut().zip(&screens) {
                 screen.scale = actual.scale;
             }
-            draft.clone()
+            (preview, draft.rects.clone())
         } else {
-            screens
+            let rects = physical_rects(&screens);
+            (screens, rects)
         };
-        let rects = physical_rects(&preview);
         let mut action = draw(ui, &phase, since, &preview, &rects, here[0].as_deref(), &mut self.edit);
 
         // The same card on every other monitor; any of them can be clicked.
@@ -752,15 +767,14 @@ impl Snap {
     }
 }
 
-/// Find a Windows-valid edge contact, then prefer a nearby alignment visible on the diagram.
+/// Find an edge contact, then prefer a nearby alignment visible on the diagram.
 fn snap_to_edge(
     screens: &[Screen], rects: &[Rect], moving: usize, desired: Pos2, points_per_mm: f32,
 ) -> Option<Snap> {
-    let mut areas: Vec<_> = screens.iter().map(Screen::area).collect();
-    let screen = areas[moving];
+    let screen = screens[moving].area();
     let size = rects[moving].size();
-    let panels: Vec<_> = areas.iter().zip(rects).enumerate()
-        .filter_map(|(index, (&area, &rect))| (index != moving).then_some((area, rect)))
+    let panels: Vec<_> = screens.iter().zip(rects).enumerate()
+        .filter_map(|(index, (screen, &rect))| (index != moving).then_some((screen.area(), rect)))
         .collect();
     let snap_distance = SNAP_DISTANCE / points_per_mm;
     let mut nearest = None;
@@ -775,10 +789,31 @@ fn snap_to_edge(
         let (_, _, moving_w, moving_h) = diagram_axes(rects[moving]);
         let desired_y = if vertical { desired.x } else { desired.y };
         let neighbours: Vec<_> = panels.iter().map(|&(area, rect)| (axes(area), diagram_axes(rect))).collect();
-        for &((x, y, w, h), (rx, ry, rw, rh)) in &neighbours {
+        for (&anchor, &((x, y, w, h), (rx, ry, rw, rh))) in panels.iter().zip(&neighbours) {
             let range = (y - height + 1)..=(y + h - 1);
             let to_pixels = |mm| y + offset_in_pixels(mm - ry, height, h, moving_h, rh);
             let min_overlap = (MIN_SEAM / points_per_mm).min(moving_h.min(rh) * 0.25);
+            let edges = [(x - width, rx - moving_w), (x + w, rx + rw)];
+            for (edge, physical_edge) in edges {
+                let position = |offset| if vertical { (offset, edge) } else { (edge, offset) };
+                let (x, y) = position(to_pixels(desired_y));
+                let proposed = Area { x, y, ..screen };
+                let min = if vertical { pos2(desired_y, physical_edge) } else { pos2(physical_edge, desired_y) };
+                let rect = Rect::from_min_size(min, size);
+                let Some(span) = constrained_seam((proposed, rect), anchor, &panels, vertical, false) else { continue };
+                let Some(offset) = span.pixel_at(desired_y) else { continue };
+                let (x, y) = position(offset);
+                let proposed = Area { x, y, ..screen };
+                if panels.iter().any(|&(area, _)| proposed.overlaps(area)) || !is_clear(rect, &panels) {
+                    continue;
+                }
+                let snap = Snap { position: (x, y), rect, distance_squared: (min - desired).length_sq() };
+                snap.prefer(&mut nearest);
+                let overlap = (desired_y + moving_h).min(ry + rh) - desired_y.max(ry);
+                if (overlap - min_overlap) * points_per_mm >= -0.25 {
+                    snap.prefer(&mut clear_seam);
+                }
+            }
             let offsets = [
                 (to_pixels(desired_y), false),
                 (to_pixels(ry + min_overlap - moving_h), false),
@@ -786,8 +821,8 @@ fn snap_to_edge(
                 (y, true),
                 (to_pixels(ry + rh - moving_h), true),
             ].into_iter().chain(neighbours.iter().flat_map(|&((_, y, _, h), (_, other_y, _, other_h))| {
-                // Desktop boundaries keep the layout connected. Physical boundaries allow the
-                // same move to clear a third display whose proportions differ in the diagram.
+                // Check both desktop and physical boundaries for nearby contacts. Panels can
+                // have different proportions in the two coordinate spaces.
                 [
                     (y - height, false), (y + h, false),
                     (y - height + 1, false), (y + h - 1, false),
@@ -797,13 +832,13 @@ fn snap_to_edge(
             for (requested, aligned) in offsets {
                 let offset = requested.clamp(*range.start(), *range.end());
                 let diagram_y = ry + offset_in_mm(offset - y, height, h, moving_h, rh);
-                for (edge, diagram_x) in [(x - width, rx - moving_w), (x + w, rx + rw)] {
+                for (edge, diagram_x) in edges {
                     let (x, y) = if vertical { (offset, edge) } else { (edge, offset) };
-                    areas[moving] = Area { x, y, ..screen };
-                    if !display::valid_layout(&areas) {
+                    let proposed = Area { x, y, ..screen };
+                    if panels.iter().any(|&(area, _)| proposed.overlaps(area)) {
                         continue;
                     }
-                    if let Some(rect) = corner_rect(areas[moving], size, &panels) {
+                    if let Some(rect) = corner_rect(proposed, size, &panels) {
                         let snap = Snap { position: (x, y), rect, distance_squared: (rect.min - desired).length_sq() };
                         snap.prefer(&mut nearest);
                         snap.prefer(&mut clear_seam);
@@ -816,15 +851,14 @@ fn snap_to_edge(
                         if vertical { pos2(diagram_y, diagram_x) } else { pos2(diagram_x, diagram_y) },
                         size,
                     );
+                    if !is_clear(rect, &panels) {
+                        continue;
+                    }
                     let snap = Snap { position: (x, y), rect, distance_squared: (rect.min - desired).length_sq() };
                     snap.prefer(&mut nearest);
 
                     let overlap = (diagram_y + moving_h).min(ry + rh) - diagram_y.max(ry);
-                    let clear = neighbours.iter().all(|&(_, (nx, ny, nw, nh))| {
-                        (diagram_x + moving_w).min(nx + nw) - diagram_x.max(nx) <= 0.001
-                            || (diagram_y + moving_h).min(ny + nh) - diagram_y.max(ny) <= 0.001
-                    });
-                    if clear && (overlap - min_overlap) * points_per_mm >= -0.25 {
+                    if (overlap - min_overlap) * points_per_mm >= -0.25 {
                         snap.prefer(&mut clear_seam);
                         if snap.near(points_per_mm) {
                             let at_three_way_corner = neighbours.iter().any(|&(_, (nx, ny, nw, nh))| {
@@ -846,6 +880,33 @@ fn snap_to_edge(
         snap.distance_squared.sqrt() <= nearest.distance_squared.sqrt() + snap_distance
     });
     Some(corner.or(clear_seam).unwrap_or(nearest))
+}
+
+fn drop_tile(screens: &[Screen], rects: &[Rect], index: usize, rect: Rect, snap: Option<Snap>, scale: f32) -> Action {
+    let others: Vec<_> = screens.iter().zip(rects).enumerate()
+        .filter_map(|(i, (screen, &rect))| (i != index).then_some((screen.area(), rect)))
+        .collect();
+    if let Some(snap) = snap.filter(|snap| snap.near(scale) || !is_clear(rect, &others)) {
+        return Action::MoveScreen { index, position: snap.position, rect: snap.rect };
+    }
+
+    let rect = nearest_clear_rect(rect, &others);
+    let desktop = desktop_rect(&screens[index]);
+    let delta = (rect.min - rects[index].min) * desktop.size() / rect.size();
+    let target = desktop.translate(delta.round());
+    // A free drop is detached in the diagram. Give it at least one pixel of clearance in
+    // desktop coordinates too, where displays with different pixel densities can overlap.
+    let blocked: Vec<_> = screens.iter().enumerate().filter(|(i, _)| *i != index)
+        .map(|(_, screen)| (screen.area(), desktop_rect(screen).expand(1.0)))
+        .collect();
+    let desktop = nearest_clear_rect(target, &blocked).min;
+    Action::MoveScreen { index, position: (desktop.x.round() as i32, desktop.y.round() as i32), rect }
+}
+
+fn connected_to_main(screens: &[Screen]) -> Vec<bool> {
+    let areas: Vec<_> = screens.iter().map(Screen::area).collect();
+    let main = screens.iter().position(|s| s.primary).unwrap_or(0);
+    display::connected_to(&areas, main)
 }
 
 fn anchor_primary(screens: &mut [Screen]) {
@@ -874,7 +935,10 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen], re
     let text_w = rect.right() - PAD - text_x;
     let (title, subtitle) = match phase {
         Phase::Working => ("Setting up your screens...", None),
-        Phase::Prompt | Phase::Applying => ("Preview", None),
+        Phase::Prompt | Phase::Applying => (
+            "Display Preview",
+            Some("Drag displays until correct. Right-click to set main display and scaling".into()),
+        ),
         Phase::Done(summary) => ("Displays ready", Some(summary.clone())),
         Phase::Kept => ("Displays ready", None),
         Phase::Failed(e) => ("Couldn't set up your displays", Some(e.clone())),
@@ -890,8 +954,10 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen], re
 
     let area = Rect::from_min_max(pos2(rect.left() + PAD, rect.top() + 84.0), pos2(rect.right() - PAD, rect.bottom() - 74.0));
     painter.rect_filled(area, CornerRadius::same(12), SURFACE);
-    let mut action = draw_screens(ui, area, screens, rects, here, phase, edit);
-    if edit.drag.is_some() {
+    let connected = connected_to_main(screens);
+    let all_connected = connected.iter().all(|&attached| attached);
+    let mut action = draw_screens(ui, area, screens, rects, &connected, here, phase, edit);
+    if edit.drag.is_some() || !all_connected {
         edit.hold_open = true;
     }
 
@@ -900,13 +966,18 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen], re
     let footer_font = regular(13.0);
     match phase {
         Phase::Prompt | Phase::Applying => {
-            let counting = interactive && edit.auto_keep() && !matches!(action, Some(Action::MoveScreen(..)));
+            let can_keep = interactive && all_connected && edit.drag.is_none();
+            let counting = can_keep && edit.auto_keep() && !matches!(action, Some(Action::MoveScreen { .. }));
             let keep = Rect::from_min_size(pos2(row.right() - 112.0, row.top()), vec2(112.0, row.height()));
             let revert = Rect::from_min_size(pos2(keep.left() - 122.0, row.top()), vec2(112.0, row.height()));
-            if button(ui, &painter, keep, "keep", "Keep", true) && interactive && edit.drag.is_none() {
+            let keep = button(ui, &painter, keep, "keep", "Keep", true, can_keep);
+            if !all_connected {
+                keep.clone().on_hover_text("Reconnect the detached displays to keep this layout");
+            }
+            if keep.clicked() {
                 action = action.or(Some(Action::Keep));
             }
-            if button(ui, &painter, revert, "revert", "Revert", false) && interactive && edit.drag.is_none() {
+            if button(ui, &painter, revert, "revert", "Revert", false, interactive && edit.drag.is_none()).clicked() {
                 action = action.or(Some(Action::Revert));
             }
             if counting {
@@ -922,7 +993,7 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen], re
                 ui.input(|i| {
                     if i.key_pressed(Key::Escape) {
                         action = Some(Action::Revert);
-                    } else if action.is_none() && edit.drag.is_none() && i.key_pressed(Key::Enter) {
+                    } else if action.is_none() && can_keep && i.key_pressed(Key::Enter) {
                         action = Some(Action::Keep);
                     }
                 });
@@ -933,10 +1004,10 @@ fn draw(ui: &mut egui::Ui, phase: &Phase, since: Instant, screens: &[Screen], re
             let revert = Rect::from_min_size(pos2(close.left() - 110.0, row.top()), vec2(100.0, row.height()));
             let note = fit(&painter, "Details in auto-display.log", &footer_font, revert.left() - row.left() - 12.0);
             painter.text(pos2(row.left(), row.center().y), Align2::LEFT_CENTER, note, footer_font, MUTED);
-            if button(ui, &painter, revert, "revert", "Revert", false) {
+            if button(ui, &painter, revert, "revert", "Revert", false, true).clicked() {
                 action = Some(Action::Revert);
             }
-            if button(ui, &painter, close, "close", "Close", false) {
+            if button(ui, &painter, close, "close", "Close", false, true).clicked() {
                 action = Some(Action::Close);
             }
         }
@@ -990,7 +1061,6 @@ fn draw_icon(painter: &Painter, c: Pos2, phase: &Phase, since: Instant, t: f32) 
     }
 }
 
-#[cfg(test)]
 fn desktop_rect(screen: &Screen) -> Rect {
     Rect::from_min_size(pos2(screen.x as f32, screen.y as f32), vec2(screen.width as f32, screen.height as f32))
 }
@@ -1001,6 +1071,7 @@ fn draw_screens(
     area: Rect,
     screens: &[Screen],
     rects: &[Rect],
+    connected: &[bool],
     here: Option<&str>,
     phase: &Phase,
     edit: &mut LayoutEdit,
@@ -1011,8 +1082,7 @@ fn draw_screens(
     let painter = ui.painter_at(area);
     let area = area.shrink2(vec2(22.0, 20.0));
     let bounds = rects.iter().fold(Rect::NOTHING, |b, &r| b.union(r));
-    // Leave room under the laptops for their keyboard decks.
-    let room = vec2(area.width(), area.height() - 6.0);
+    let room = area.size();
     let scale = (room.x / bounds.width().max(1.0)).min(room.y / bounds.height().max(1.0));
     let offset = area.min + (room - bounds.size() * scale) / 2.0;
     let to_card = |r: Rect| {
@@ -1029,36 +1099,40 @@ fn draw_screens(
 
     let viewport = ctx.viewport_id();
     let editable = *phase == Phase::Prompt;
-    let controls = matches!(phase, Phase::Prompt | Phase::Applying);
+    let multiple_displays = screens.len() > 1;
     let drag = &mut edit.drag;
     let mut action = None;
     let mut moving = None;
     for (index, screen) in screens.iter().enumerate() {
         let target = to_card(rects[index]);
         let rect = if *phase == Phase::Working { animate(&screen.id, target) } else { target };
-        let buttons = controls.then(|| tile_controls(rect, screens.len() > 1));
-        let controls_top = buttons.map(|(main, scale)| main.map_or(scale.top(), |main| main.top()));
-        if editable && screens.len() > 1 {
+        let detached = matches!(phase, Phase::Prompt | Phase::Applying) && !connected[index];
+        let sense = if !editable {
+            Sense::hover()
+        } else if multiple_displays {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        };
+        let response = ui.interact(rect, ui.id().with((&screen.id, "display")), sense);
+        let response = if detached { response.on_hover_text("Detached from the main display") } else { response };
+        if editable && response.is_pointer_button_down_on() {
+            edit.hold_open = true;
+        }
+        if editable && multiple_displays {
             let button = egui::PointerButton::Primary;
-            let response = ui.interact(rect, ui.id().with((&screen.id, "drag")), Sense::drag())
-                .on_hover_cursor(CursorIcon::Grab);
+            response.clone().on_hover_cursor(CursorIcon::Grab);
             if response.drag_started_by(button) && drag.is_none()
                 && let Some(start) = ui.input(|i| i.pointer.press_origin())
                 && rect.contains(start)
-                && !buttons.is_some_and(|(main, scale)| {
-                    scale.contains(start) || main.is_some_and(|main| main.contains(start))
-                })
             {
                 *drag = Some(Drag { viewport, screen: index, start, rect, scale, origin_mm: rects[index].min });
             }
             if let Some(active) = drag.as_ref().filter(|d| d.viewport == viewport && d.screen == index) {
                 let delta = response.interact_pointer_pos().unwrap_or(active.start) - active.start;
-                let snap = if delta.length_sq() >= 1.0 {
-                    let desired = active.origin_mm + delta / active.scale;
-                    snap_to_edge(screens, rects, index, desired, active.scale)
-                } else {
-                    None
-                };
+                let desired = active.origin_mm + delta / active.scale;
+                let moved = delta.length_sq() >= 1.0;
+                let snap = moved.then(|| snap_to_edge(screens, rects, index, desired, active.scale)).flatten();
                 if response.dragged_by(button) {
                     ctx.set_cursor_icon(CursorIcon::Grabbing);
                     let snapped = snap.filter(|target| target.near(active.scale));
@@ -1066,29 +1140,23 @@ fn draw_screens(
                     moving = Some((index, rect, snapped.is_some()));
                     continue;
                 }
-                if response.drag_stopped_by(button) && let Some(Snap { position: (x, y), .. }) = snap {
-                    action = Some(Action::MoveScreen(index, x, y));
+                if response.drag_stopped_by(button) && moved {
+                    let tile = Rect::from_min_size(desired, rects[index].size());
+                    action = Some(drop_tile(screens, rects, index, tile, snap, active.scale));
                 }
                 *drag = None;
             }
         }
-        draw_screen(&painter, screen, rect, here == Some(screen.id.as_str()), controls_top);
-        if let Some((main, menu_rect)) = buttons {
-            let editable = editable && drag.is_none();
-            if let Some(main) = main
-                && main_display_button(ui, &painter, screen, main, editable)
-            {
-                action = action.or(Some(Action::SetMain(index)));
-            }
-            let (opened, changed) = scale_menu(ui, &painter, screen, menu_rect, editable);
+        draw_screen(&painter, screen, rect, here == Some(screen.id.as_str()), detached, false);
+        if editable && drag.is_none() {
+            let (opened, selected) = display_menu(&response, screen, index, multiple_displays);
             edit.hold_open |= opened;
-            if let Some(percent) = changed {
-                action = action.or(Some(Action::SetScale(index, percent)));
-            }
+            action = action.or(selected);
         }
     }
     if let Some((index, rect, snapped)) = moving {
-        draw_screen(&painter, &screens[index], rect, true, None);
+        let screen = &screens[index];
+        draw_screen(&painter, screen, rect, here == Some(screen.id.as_str()), false, true);
         if snapped {
             for (i, neighbour) in rects.iter().enumerate() {
                 if i != index {
@@ -1112,135 +1180,109 @@ fn draw_snap_seam(painter: &Painter, tile: Rect, neighbour: Rect) {
     }
 }
 
-fn tile_controls(tile: Rect, multiple_displays: bool) -> (Option<Rect>, Rect) {
-    let padding = vec2((tile.width() * 0.12).min(12.0), (tile.height() * 0.14).min(10.0));
-    let inner = tile.shrink2(padding);
-    let max_width = if multiple_displays { 142.0 } else { 76.0 };
-    let size = vec2(inner.width().clamp(1.0, max_width), (tile.height() * 0.36).min(24.0));
-    let row = Rect::from_center_size(pos2(inner.center().x, inner.bottom() - size.y / 2.0), size);
-    if !multiple_displays {
-        return (None, row);
-    }
-    if row.width() < 78.0 && inner.height() > 74.0 {
-        return (Some(row.translate(vec2(0.0, -row.height() - 5.0))), row);
-    }
-    let gap = (row.width() * 0.08).min(6.0);
-    let main_width = (row.width() - gap) * 0.5;
-    let main = Rect::from_min_size(row.min, vec2(main_width, row.height()));
-    let scale = row.with_min_x(main.right() + gap);
-    (Some(main), scale)
-}
-
-fn main_display_button(ui: &egui::Ui, painter: &Painter, screen: &Screen, rect: Rect, editable: bool) -> bool {
-    let enabled = editable && !screen.primary;
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let title = if screen.primary { "Main display" } else { "Make this the main display" };
-    let response = ui.interact(rect, ui.id().with((&screen.id, "main")), sense).on_hover_text(title);
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, title));
-    let response = if enabled { response.on_hover_cursor(CursorIcon::PointingHand) } else { response };
-    let fill = if screen.primary { ACCENT } else if response.hovered() && enabled { BUTTON_HOVER } else { BUTTON };
-    painter.rect_filled(rect, CornerRadius::same(5), fill);
-    let font = semibold((rect.width() * 0.23).min(rect.height() * 0.68).clamp(1.0, 12.0));
-    let label = if !screen.primary && rect.width() >= 56.0 { "Make main" } else { "Main" };
-    let label = fit(painter, label, &font, rect.width() - 3.0);
-    centered_text(painter, rect.center(), label, font, TEXT);
-    response.clicked()
-}
-
-fn scale_menu(ui: &mut egui::Ui, painter: &Painter, screen: &Screen, rect: Rect, editable: bool) -> (bool, Option<u32>) {
-    let enabled = editable && screen.scale.is_some();
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let response = ui.interact(rect, ui.id().with((&screen.id, "scale")), sense);
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, enabled, "Display scaling"));
-    let response = if enabled { response.on_hover_cursor(CursorIcon::PointingHand) } else { response };
-    let fill = if response.hovered() && enabled { BUTTON_HOVER } else { BUTTON };
-    painter.rect_filled(rect, CornerRadius::same(5), fill);
-
-    let font_size = (rect.width() * 0.22).min(rect.height() * 0.65).clamp(1.0, 12.0);
-    let font = semibold(font_size);
-    let description = screen.scale.map_or_else(|| "Scale".into(), |scale| format!("{}%", scale.current));
-    let arrow = if rect.width() >= 34.0 && screen.scale.is_some() { 5.0 } else { 0.0 };
-    let gap = if arrow > 0.0 { 4.0 } else { 0.0 };
-    let description = fit(painter, &description, &font, rect.width() - gap - arrow - 4.0);
-    let color = if enabled { TEXT } else { MUTED };
-    let galley = painter.layout_no_wrap(description, font, color);
-    let label_width = galley.mesh_bounds.width();
-    let center = rect.center();
-    let label_center = center - vec2((gap + arrow) / 2.0, 0.0);
-    painter.galley(label_center - galley.mesh_bounds.center().to_vec2(), galley, color);
-    if arrow > 0.0 {
-        let x = center.x + (label_width + gap) / 2.0;
-        let stroke = Stroke::new(1.0, color);
-        painter.line_segment([pos2(x - 2.5, center.y - 1.0), pos2(x, center.y + 1.5)], stroke);
-        painter.line_segment([pos2(x, center.y + 1.5), pos2(x + 2.5, center.y - 1.0)], stroke);
-    }
-
-    let popup = egui::Popup::menu(&response).width(rect.width().max(80.0)).show(|ui| {
-        let mut chosen = None;
-        let options = [50, 75].into_iter().chain(display::SCALES.into_iter().take_while(|&p| p <= 300));
-        for percent in options {
-            let allowed = enabled && screen.scale.is_some_and(|s| s.relative_for(percent).is_ok());
-            let selected = screen.scale.is_some_and(|s| s.current == percent);
-            let item = ui.add_enabled(allowed, egui::Button::selectable(selected, format!("{percent}%")));
-            if item.clicked() && !selected {
-                chosen = Some(percent);
-            }
+fn display_menu(response: &egui::Response, screen: &Screen, index: usize, multiple_displays: bool) -> (bool, Option<Action>) {
+    let popup = egui::Popup::context_menu(response).width(150.0).show(|ui| {
+        let main_label = if screen.primary { "Main display" } else { "Set to main display" };
+        if ui.add_enabled(multiple_displays && !screen.primary, egui::Button::selectable(screen.primary, main_label)).clicked() {
+            ui.close();
+            return Some(Action::SetMain(index));
         }
-        chosen
+        let mut chosen = None;
+        ui.add_enabled_ui(screen.scale.is_some(), |ui| {
+            ui.menu_button("Adjust scaling", |ui| {
+                let options = [50, 75].into_iter().chain(display::SCALES.into_iter().take_while(|&p| p <= 300));
+                for percent in options {
+                    let allowed = screen.scale.is_some_and(|s| s.relative_for(percent).is_ok());
+                    let selected = screen.scale.is_some_and(|s| s.current == percent);
+                    if ui.add_enabled(allowed, egui::Button::selectable(selected, format!("{percent}%"))).clicked() {
+                        chosen = Some((percent, selected));
+                        ui.close();
+                    }
+                }
+            });
+        });
+        if let Some((percent, selected)) = chosen {
+            ui.close();
+            return (!selected).then_some(Action::SetScale(index, percent));
+        }
+        None
     });
-    (response.clicked() || popup.is_some(), popup.and_then(|p| p.inner))
+    (popup.is_some(), popup.and_then(|p| p.inner))
 }
 
 /// Draws one screen. `here` highlights it as the screen this card is on.
-fn draw_screen(painter: &Painter, s: &Screen, r: Rect, here: bool, controls_top: Option<f32>) {
+fn draw_screen(painter: &Painter, s: &Screen, r: Rect, here: bool, detached: bool, dragging: bool) {
     let radius = CornerRadius::same(5);
+    let highlighted = here || dragging;
     painter.rect_filled(r, radius, SCREEN);
-    if here {
+    let edge = if detached {
+        painter.rect_filled(r, radius, BAD.gamma_multiply(0.16));
+        Stroke::new(1.5, BAD)
+    } else if highlighted {
         painter.rect_filled(r, radius, ACCENT.gamma_multiply(0.14));
-    }
-    let edge = if here { Stroke::new(1.5, ACCENT) } else { Stroke::new(1.0, SCREEN_EDGE) };
+        Stroke::new(1.5, ACCENT)
+    } else {
+        Stroke::new(1.0, SCREEN_EDGE)
+    };
     painter.rect_stroke(r, radius, edge, StrokeKind::Inside);
-    if s.internal {
-        // The laptop's keyboard deck.
-        let deck = Rect::from_min_max(pos2(r.left() - 6.0, r.bottom() + 1.0), pos2(r.right() + 6.0, r.bottom() + 5.0));
-        painter.rect_filled(deck, CornerRadius::same(2), SCREEN_EDGE);
+    if detached {
+        let radius = (r.width().min(r.height()) * 0.15).min(8.0);
+        let center = r.right_top() + vec2(-1.5, 1.5) * radius;
+        painter.circle_filled(center, radius, BAD);
+        let mark = Stroke::new(radius * 0.24, BG);
+        painter.line_segment([center - vec2(0.0, radius * 0.52), center], mark);
+        painter.circle_filled(center + vec2(0.0, radius * 0.43), mark.width * 0.56, BG);
     }
 
-    let r = controls_top.map_or(r, |top| r.with_max_y(top - 2.0));
-    let name_font = regular(12.5);
-    let name = label(painter, &s.name, &name_font, r.width() - 12.0);
+    let text_width = (r.width() - 12.0).max(1.0);
+    let name_font = regular(if here { (r.height() * 0.32).clamp(1.0, 12.5) } else { 12.5 });
+    let name = label(painter, &s.name, &name_font, text_width);
+    let name_color = if highlighted { TEXT } else { MUTED };
     let inches = s.mm.map(|(w, h)| (w * w + h * h).sqrt() / 25.4).filter(|d| *d > 5.0 && !s.name.contains(" + "));
-    let detail = match (s.primary && controls_top.is_none(), inches) {
-        (true, Some(d)) => Some((format!("Main display · {d:.0}\""), if here { ACCENT_TEXT } else { MUTED })),
-        (true, None) => Some(("Main display".to_string(), if here { ACCENT_TEXT } else { MUTED })),
-        (false, Some(d)) => Some((format!("{d:.0}\""), MUTED)),
-        (false, None) => None,
+    let detail = match (here, s.primary, inches) {
+        (true, true, Some(d)) => Some((format!("This Display · Main · {d:.0}\""), Color32::LIGHT_GRAY)),
+        (true, true, None) => Some(("This Display · Main".into(), Color32::LIGHT_GRAY)),
+        (true, false, Some(d)) => Some((format!("This Display · {d:.0}\""), Color32::LIGHT_GRAY)),
+        (true, false, None) => Some(("This Display".into(), Color32::LIGHT_GRAY)),
+        (false, true, Some(d)) => Some((format!("Main · {d:.0}\""), if dragging { ACCENT_TEXT } else { MUTED })),
+        (false, true, None) => Some(("Main".into(), if dragging { ACCENT_TEXT } else { MUTED })),
+        (false, false, Some(d)) => Some((format!("{d:.0}\""), MUTED)),
+        (false, false, None) => None,
     };
     match detail {
-        Some((text, colour)) if r.height() > 40.0 => {
-            painter.text(r.center() - vec2(0.0, 8.0), Align2::CENTER_CENTER, name, name_font, if here { TEXT } else { MUTED });
-            let detail_font = semibold(11.0);
-            let text = fit(painter, &text, &detail_font, r.width() - 12.0);
-            painter.text(r.center() + vec2(0.0, 9.0), Align2::CENTER_CENTER, text, detail_font, colour);
+        Some((text, colour)) if here || r.height() > 40.0 => {
+            let spacing = (r.height() * 0.22).min(8.5);
+            painter.text(r.center() - vec2(0.0, spacing), Align2::CENTER_CENTER, name, name_font, name_color);
+            let detail_font = if here {
+                let width = painter.layout_no_wrap(text.clone(), regular(11.0), colour).size().x;
+                regular((11.0 * (text_width / width).min(1.0)).min(r.height() * 0.3).max(1.0))
+            } else {
+                semibold(11.0)
+            };
+            let text = fit(painter, &text, &detail_font, text_width);
+            painter.text(r.center() + vec2(0.0, spacing), Align2::CENTER_CENTER, text, detail_font, colour);
         }
         _ => {
-            painter.text(r.center(), Align2::CENTER_CENTER, name, name_font, if here { TEXT } else { MUTED });
+            painter.text(r.center(), Align2::CENTER_CENTER, name, name_font, name_color);
         }
     }
 }
 
-fn button(ui: &egui::Ui, painter: &Painter, rect: Rect, id: &str, label: &str, primary: bool) -> bool {
-    let response = ui.interact(rect, ui.id().with(id), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+fn button(ui: &egui::Ui, painter: &Painter, rect: Rect, id: &str, label: &str, primary: bool, enabled: bool) -> egui::Response {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let response = ui.interact(rect, ui.id().with(id), sense);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    let response = if enabled { response.on_hover_cursor(CursorIcon::PointingHand) } else { response };
     let hovered = response.hovered();
     let radius = CornerRadius::same(10);
-    if primary {
+    if primary && enabled {
         painter.rect_filled(rect, radius, if hovered { ACCENT_HOVER } else { ACCENT });
     } else {
-        painter.rect_filled(rect, radius, if hovered { BUTTON_HOVER } else { BUTTON });
+        painter.rect_filled(rect, radius, if hovered && enabled { BUTTON_HOVER } else { BUTTON });
         painter.rect_stroke(rect, radius, Stroke::new(1.0, SCREEN_EDGE), StrokeKind::Inside);
     }
-    centered_text(painter, rect.center(), label.into(), semibold(14.0), TEXT);
-    response.clicked()
+    centered_text(painter, rect.center(), label.into(), semibold(14.0), if enabled { TEXT } else { MUTED });
+    response
 }
 
 fn centered_text(painter: &Painter, center: Pos2, label: String, font: FontId, color: Color32) {
@@ -1556,9 +1598,9 @@ mod tests {
         let end = start + vec2(530.0 + 336.0 + 20.0, 300.0 * 300.0 / 1080.0) * scale;
         let mouse = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
         frame(vec![Event::PointerMoved(start), mouse(start, true)], &mut card.edit);
-        assert!(card.edit.drag.is_some());
         let far = end + vec2(30.0, 0.0);
         let (dragged, action) = frame(vec![Event::PointerMoved(far)], &mut card.edit);
+        assert!(card.edit.drag.is_some());
         assert!(action.is_none());
         assert!((dragged[1].center() - far).length() < 0.01);
         let (snapped, action) = frame(vec![Event::PointerMoved(end)], &mut card.edit);
@@ -1568,7 +1610,7 @@ mod tests {
         let (_, drop) = frame(vec![mouse(end, false)], &mut card.edit);
         card.act(drop.expect("drop action"), &ctx);
         assert_eq!(state.lock().unwrap().screens, screens);
-        let moved = card.draft.as_ref().unwrap().clone();
+        let moved = card.draft.as_ref().unwrap().screens.clone();
         assert_eq!((moved[0].x, moved[0].y), (1920, 300));
 
         let keep = pos2(WIDTH - PAD - 50.0, HEIGHT - 37.0);
@@ -1629,6 +1671,32 @@ mod tests {
     }
 
     #[test]
+    fn laptop_slides_lower_beside_portrait_and_above_main() {
+        let mut screens = [
+            screen("main", false, true, (0, 0, 2560, 1440), (597.0, 336.0)),
+            screen("portrait", false, false, (-1080, -1480, 1080, 1920), (530.0, 280.0)),
+            screen("laptop", true, false, (0, -3250, 3840, 2400), (344.0, 215.0)),
+        ];
+        let rects = physical_rects(&screens);
+        let desired = pos2(-3.0, -342.0);
+        assert!(rects[2].top() < desired.y);
+        let snap = snap_to_edge(&screens, &rects, 2, desired, 0.258).unwrap();
+        assert!(snap.near(0.258));
+        assert_eq!(snap.position.0, 0);
+        assert!((screens[2].y + 1..-2400).contains(&snap.position.1));
+        assert_eq!(snap.rect.top(), desired.y);
+
+        screens[2].y = snap.position.1;
+        assert!(display::valid_layout(&screens.iter().map(Screen::area).collect::<Vec<_>>()));
+        let reopened = physical_rects(&screens);
+        assert!((reopened[2].top() - desired.y).abs() < 0.3);
+
+        let corner = snap_to_edge(&screens, &reopened, 2, pos2(-3.0, -220.0), 0.258).unwrap();
+        assert_eq!(corner.position, (0, -2400));
+        assert_eq!(corner.rect.bottom(), reopened[0].top());
+    }
+
+    #[test]
     fn drags_laptop_straight_from_the_inside_corner_to_the_left_of_main() {
         use egui::{Event, Modifiers, PointerButton};
 
@@ -1656,7 +1724,7 @@ mod tests {
         };
         let (tiles, _) = frame(vec![], &mut card.edit);
         let [laptop, _, main]: [Rect; 3] = tiles.try_into().unwrap();
-        // The padded part next to the controls is still part of the tile.
+        // The full tile is a drag target.
         let start = laptop.left_top() + vec2(3.0, laptop.height() * 0.72);
         let desired = pos2(main.left() - laptop.width() + 4.0, main.top() + 5.0);
         let end = start + (desired - laptop.min);
@@ -1665,8 +1733,8 @@ mod tests {
         };
 
         frame(vec![Event::PointerMoved(start), mouse(start, true)], &mut card.edit);
-        assert!(card.edit.drag.is_some(), "The laptop tile must drag from its padded body.");
         let (snapped, action) = frame(vec![Event::PointerMoved(end)], &mut card.edit);
+        assert!(card.edit.drag.is_some(), "The laptop tile must drag from its edge.");
         assert!(action.is_none());
         let tile = snapped.last().unwrap();
         assert!((tile.right() - main.left()).abs() < 0.01);
@@ -1674,7 +1742,7 @@ mod tests {
         let (_, drop) = frame(vec![mouse(end, false)], &mut card.edit);
         card.act(drop.expect("laptop drop"), &ctx);
 
-        let staged = card.draft.as_ref().unwrap();
+        let staged = &card.draft.as_ref().unwrap().screens;
         assert_eq!((staged[0].x, staged[0].y), (-3840, 0));
         assert_eq!(staged[1..], screens[1..]);
         assert_eq!(state.lock().unwrap().screens, screens);
@@ -1695,19 +1763,123 @@ mod tests {
     }
 
     #[test]
-    fn snapping_preserves_connections_when_moving_a_bridge_display() {
+    fn snapping_allows_a_bridge_display_to_move_to_another_edge() {
         let screens = [
-            screen("left", false, false, (-100, 0, 100, 100), (1.0, 1.0)),
+            screen("left", false, false, (-200, 0, 100, 100), (1.0, 1.0)),
             screen("main", false, true, (0, 0, 100, 100), (1.0, 1.0)),
-            screen("right", false, false, (100, 0, 100, 100), (1.0, 1.0)),
+            screen("laptop", true, false, (-100, 0, 100, 100), (1.0, 1.0)),
         ];
-        // Leave a visible shared seam on both sides.
-        assert_eq!(snap_position(&screens, 1, (0, 110)), Some((0, 92)));
-        assert_eq!(snap_position(&screens, 2, (0, -120)), Some((0, -100)));
+        assert_eq!(snap_position(&screens, 2, (102, 4)), Some((100, 0)));
     }
 
     #[test]
-    fn inline_scaling_applies_to_one_display_and_revert_restores_it() {
+    fn moving_the_laptop_keeps_the_detached_display_in_place_until_reconnected() {
+        use egui::{Event, Modifiers, PointerButton};
+
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let screens = vec![
+            screen("left", false, false, (-200, 0, 100, 100), (100.0, 100.0)),
+            screen("laptop", true, false, (-100, 0, 100, 100), (100.0, 100.0)),
+            screen("main", false, true, (0, 0, 100, 100), (100.0, 100.0)),
+        ];
+        let diagram = physical_rects(&screens);
+        let since = Instant::now();
+        let state = Arc::new(Mutex::new(Shared {
+            phase: Phase::Prompt, since, screens: screens.clone(), needs_taskbar_refresh: false, pointer_settlement: None,
+        }));
+        let mut card = Card::new(state.clone(), Some(Preview { kind: "portrait".into() }), None);
+        let mut time = 0.0;
+        let mut frame = |events, card: &mut Card| {
+            let (screens, rects) = card.draft.as_ref().map_or((&screens, &diagram), |draft| (&draft.screens, &draft.rects));
+            let mut action = None;
+            let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), time, events, |ui| {
+                action = draw(ui, &Phase::Prompt, since, screens, rects, None, &mut card.edit);
+            });
+            time += 0.1;
+            (output, action)
+        };
+        let mouse = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let (initial, _) = frame(vec![], &mut card);
+        let tiles = screen_rects(&initial);
+        let start = tiles[1].center();
+        let end = tiles[2].center() - vec2(0.0, tiles[1].height());
+        frame(vec![Event::PointerMoved(start), mouse(start, true)], &mut card);
+        frame(vec![Event::PointerMoved(end)], &mut card);
+        let (_, action) = frame(vec![mouse(end, false)], &mut card);
+        card.act(action.expect("laptop drop"), &ctx);
+
+        let draft = card.draft.as_ref().unwrap();
+        assert_eq!(draft.screens[0], screens[0]);
+        assert_eq!(draft.rects[0], diagram[0]);
+        assert_eq!(draft.rects[2], diagram[2]);
+        assert_eq!(connected_to_main(&draft.screens), [false, true, true]);
+
+        let (output, _) = frame(vec![], &mut card);
+        let detached = screen_rects(&output)[0];
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, Shape::Circle(icon) if icon.fill == BAD && detached.contains(icon.center))
+        }));
+        frame(vec![Event::PointerMoved(detached.center())], &mut card);
+        for _ in 0..7 {
+            frame(vec![], &mut card);
+        }
+        let (hovered, _) = frame(vec![], &mut card);
+        text_center(&hovered, "Detached from the main display");
+
+        let keep = pos2(WIDTH - PAD - 50.0, HEIGHT - 37.0);
+        frame(vec![Event::PointerMoved(keep), mouse(keep, true)], &mut card);
+        assert!(frame(vec![mouse(keep, false)], &mut card).1.is_none());
+        let enter = Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        assert!(frame(vec![enter], &mut card).1.is_none());
+        card.act(Action::Keep, &ctx);
+        assert_eq!(state.lock().unwrap().screens, screens);
+
+        let (output, _) = frame(vec![], &mut card);
+        let tiles = screen_rects(&output);
+        let start = tiles[0].center();
+        let end = tiles[2].center() - vec2(tiles[0].width(), 0.0);
+        frame(vec![Event::PointerMoved(start), mouse(start, true)], &mut card);
+        frame(vec![Event::PointerMoved(end)], &mut card);
+        let (_, action) = frame(vec![mouse(end, false)], &mut card);
+        card.act(action.expect("reattach the left display"), &ctx);
+        assert_eq!(connected_to_main(&card.draft.as_ref().unwrap().screens), [true, true, true]);
+
+        let (reattached, _) = frame(vec![], &mut card);
+        assert!(!reattached.shapes.iter().any(|shape| matches!(&shape.shape, Shape::Circle(icon) if icon.fill == BAD)));
+        frame(vec![Event::PointerMoved(keep), mouse(keep, true)], &mut card);
+        let (_, action) = frame(vec![mouse(keep, false)], &mut card);
+        assert!(matches!(action, Some(Action::Keep)));
+        card.act(action.unwrap(), &ctx);
+        assert!(matches!(state.lock().unwrap().phase, Phase::Kept));
+    }
+
+    #[test]
+    fn dropping_clear_of_an_edge_preserves_the_gap() {
+        let mut screens = [
+            screen("main", false, true, (0, 0, 200, 100), (200.0, 100.0)),
+            screen("laptop", true, false, (200, 0, 400, 200), (130.0, 65.0)),
+        ];
+        let rects = physical_rects(&screens);
+        let target = rects[1].translate(vec2(30.0, 0.0));
+        let snap = snap_to_edge(&screens, &rects, 1, target.min, 1.0);
+        let Action::MoveScreen { position, rect, .. } = drop_tile(&screens, &rects, 1, target, snap, 1.0) else {
+            panic!("expected a move");
+        };
+        (screens[1].x, screens[1].y) = position;
+        assert_eq!(rect, target);
+        assert_eq!(connected_to_main(&screens), [true, false]);
+    }
+
+    fn text_center(output: &egui::FullOutput, label: &str) -> Pos2 {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            Shape::Text(text) if text.galley.text() == label => Some(text.pos + text.galley.size() / 2.0),
+            _ => None,
+        }).unwrap_or_else(|| panic!("could not find {label}"))
+    }
+
+    #[test]
+    fn scaling_menu_applies_to_one_display_and_revert_restores_it() {
         use egui::{Event, Modifiers, PointerButton};
 
         let ctx = egui::Context::default();
@@ -1724,39 +1896,39 @@ mod tests {
             let mut action = None;
             let current = state.lock().unwrap().screens.clone();
             let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), time, events, |ui| {
-                action = draw(ui, &Phase::Prompt, since, &current, &physical_rects(&current), None, edit);
+                action = draw(ui, &Phase::Prompt, since, &current, &physical_rects(&current), Some(&current[1].id), edit);
             });
             time += 0.1;
             (output, action)
         };
-        let text_center = |output: &egui::FullOutput, label: &str| {
-            output.shapes.iter().find_map(|shape| match &shape.shape {
-                Shape::Text(text) if text.galley.text() == label => Some(text.pos + text.galley.size() / 2.0),
-                _ => None,
-            }).unwrap_or_else(|| panic!("could not find {label}"))
-        };
-        let mouse = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let mouse = |pos, button, pressed| Event::PointerButton { pos, button, pressed, modifiers: Modifiers::NONE };
         let (output, _) = frame(vec![], &mut card.edit);
-        let controls = screen_rects(&output);
-        let scale = tile_controls(controls[1], true).1.center();
-        frame(vec![Event::PointerMoved(scale), mouse(scale, true)], &mut card.edit);
-        frame(vec![mouse(scale, false)], &mut card.edit);
+        text_center(&output, "Display Preview");
+        text_center(&output, "Drag displays until correct. Right-click to set main display and scaling");
+        assert!(text_center(&output, "This Display · Main · 27\"").y > text_center(&output, &screens[1].name).y);
+        let tile = screen_rects(&output)[1].center();
+        frame(vec![Event::PointerMoved(tile), mouse(tile, PointerButton::Secondary, true)], &mut card.edit);
+        frame(vec![mouse(tile, PointerButton::Secondary, false)], &mut card.edit);
+        let (menu, _) = frame(vec![], &mut card.edit);
+        let scale = text_center(&menu, "Adjust scaling");
+        frame(vec![Event::PointerMoved(scale), mouse(scale, PointerButton::Primary, true)], &mut card.edit);
+        frame(vec![mouse(scale, PointerButton::Primary, false)], &mut card.edit);
         let (popup, _) = frame(vec![], &mut card.edit);
         let option = text_center(&popup, "125%");
-        frame(vec![Event::PointerMoved(option), mouse(option, true)], &mut card.edit);
-        let (_, action) = frame(vec![mouse(option, false)], &mut card.edit);
+        frame(vec![Event::PointerMoved(option), mouse(option, PointerButton::Primary, true)], &mut card.edit);
+        let (_, action) = frame(vec![mouse(option, PointerButton::Primary, false)], &mut card.edit);
         assert!(matches!(action, Some(Action::SetScale(1, 125))));
         card.act(action.unwrap(), &ctx);
         let applied = state.lock().unwrap().screens.clone();
         assert_eq!(applied[1].scale.unwrap().current, 125);
         assert_eq!(applied[0].scale, screens[0].scale);
-        assert!(card.draft.as_ref().unwrap()[0].primary);
+        assert!(card.draft.as_ref().unwrap().screens[0].primary);
         assert_eq!(applied[0].area(), screens[0].area());
         assert!(!applied[0].primary);
 
         let revert = pos2(WIDTH - PAD - 168.0, HEIGHT - 37.0);
-        frame(vec![Event::PointerMoved(revert), mouse(revert, true)], &mut card.edit);
-        let (_, action) = frame(vec![mouse(revert, false)], &mut card.edit);
+        frame(vec![Event::PointerMoved(revert), mouse(revert, PointerButton::Primary, true)], &mut card.edit);
+        let (_, action) = frame(vec![mouse(revert, PointerButton::Primary, false)], &mut card.edit);
         assert!(matches!(action, Some(Action::Revert)));
         card.act(action.unwrap(), &ctx);
         assert!(card.draft.is_none());
@@ -1764,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn main_button_stages_the_primary_without_changing_relative_positions() {
+    fn main_menu_stages_the_primary_without_changing_relative_positions() {
         use egui::{Event, Modifiers, PointerButton};
 
         let ctx = egui::Context::default();
@@ -1786,18 +1958,22 @@ mod tests {
                 action = draw(ui, &Phase::Prompt, since, &screens, &physical_rects(&screens), None, edit);
             });
             time += 0.1;
-            (screen_rects(&output), action)
+            (output, action)
         };
-        let (tiles, _) = frame(vec![], &mut card.edit);
-        let main = tile_controls(tiles[portrait], true).0.unwrap().center();
-        let click = |pressed| Event::PointerButton { pos: main, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-        frame(vec![Event::PointerMoved(main), click(true)], &mut card.edit);
-        let (_, action) = frame(vec![click(false)], &mut card.edit);
+        let (output, _) = frame(vec![], &mut card.edit);
+        let tile = screen_rects(&output)[portrait].center();
+        let mouse = |pos, button, pressed| Event::PointerButton { pos, button, pressed, modifiers: Modifiers::NONE };
+        frame(vec![Event::PointerMoved(tile), mouse(tile, PointerButton::Secondary, true)], &mut card.edit);
+        frame(vec![mouse(tile, PointerButton::Secondary, false)], &mut card.edit);
+        let (menu, _) = frame(vec![], &mut card.edit);
+        let main = text_center(&menu, "Set to main display");
+        frame(vec![Event::PointerMoved(main), mouse(main, PointerButton::Primary, true)], &mut card.edit);
+        let (_, action) = frame(vec![mouse(main, PointerButton::Primary, false)], &mut card.edit);
         assert!(matches!(action, Some(Action::SetMain(i)) if i == portrait));
         card.act(action.unwrap(), &ctx);
 
         assert_eq!(state.lock().unwrap().screens, screens);
-        let current = card.draft.as_ref().unwrap();
+        let current = &card.draft.as_ref().unwrap().screens;
         assert_eq!(current.iter().filter(|s| s.primary).count(), 1);
         assert!(current[portrait].primary);
         assert_eq!((current[portrait].x, current[portrait].y), (0, 0));
@@ -1815,7 +1991,7 @@ mod tests {
         let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(118.0, 34.0));
         for primary in [false, true] {
             let output = paint_frame(&ctx, ViewportId::ROOT, vec2(WIDTH, HEIGHT), 0.0, vec![], |ui| {
-                button(ui, ui.painter(), rect, "test button", "Keep", primary);
+                button(ui, ui.painter(), rect, "test button", "Keep", primary, true);
             });
             let glyph_center = output.shapes.iter().find_map(|shape| match &shape.shape {
                 Shape::Text(text) if text.galley.text() == "Keep" => Some(text.pos + text.galley.mesh_bounds.center().to_vec2()),

@@ -22,10 +22,11 @@ saved scaling. The automatic layout defaults are:
 - **One monitor:** the laptop sits to its left.
 - **Two monitors:** side by side, with the right one as the main display and the laptop centred below.
 
-The **Preview** card draws each display to scale using its reported physical dimensions. Drag a
-display or use **Main** on a tile to edit the preview layout. **Keep** saves those edits to Windows.
-Use the scaling menu in a tile to change that display's scale immediately. **Revert** restores
-the settings from before setup. The card closes after 10 seconds if you leave it alone.
+The **Display Preview** card draws each display to scale using its reported physical dimensions. Drag a
+display to move it. Right-click a tile to choose the main display or change that display's scaling.
+Scaling changes apply immediately. Detached displays turn red until you reconnect them, and
+**Keep** saves the arrangement once all displays are connected. **Revert** restores the settings
+from before setup. If you leave the preview alone, it keeps the setup after 10 seconds.
 
 ## Install
 
