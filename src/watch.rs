@@ -17,7 +17,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
-use crate::{display, fix, install, log, update};
+use crate::{config, display, fix, install, log, update};
 
 const CLASS_NAME: &str = "auto-display-watcher";
 const MUTEX_NAME: &str = "Local\\auto-display";
@@ -227,14 +227,15 @@ fn first_card_this_boot() -> bool {
 }
 
 /// The setup runs in its own process so it can show the on-screen card. If it cannot be started,
-/// set the displays up here without the card.
+/// set the displays up here without the card. Either way this is the once-per-sign-in setup, so it
+/// applies the configured scaling unless config.toml turns that off.
 fn start_setup() {
     let started = std::env::current_exe()
         .map_err(|e| e.to_string())
-        .and_then(|exe| install::start_detached(&format!("\"{}\"", exe.display())));
+        .and_then(|exe| install::start_detached(&format!("\"{}\" setup", exe.display())));
     if let Err(e) = started {
         log::line(&format!("Could not start the setup card ({e}); setting up without it."));
-        if let Err(e) = fix::setup() {
+        if let Err(e) = fix::setup(config::load().apply_scaling_at_sign_in) {
             log::line(&format!("error: {e}"));
         }
     }

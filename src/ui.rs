@@ -107,8 +107,10 @@ fn set_phase_with(state: &State, ctx: &egui::Context, phase: Phase, screens: Opt
     ctx.request_repaint_of(ViewportId::ROOT);
 }
 
-/// Opens the card with the Windows layout for the connected displays.
-pub fn run() -> Result<(), String> {
+/// Opens the card with the Windows layout for the connected displays. `startup` applies the
+/// configured scaling even when Windows already has a layout for these displays (Windows keeps
+/// scaling per monitor, not with the layout); the first setup after sign-in sets it from config.toml.
+pub fn run(startup: bool) -> Result<(), String> {
     let name = watch::wide("Local\\auto-display-setup");
     let mutex = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
     if !mutex.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
@@ -117,15 +119,15 @@ pub fn run() -> Result<(), String> {
     let snapshot = Snapshot::capture()?;
     let duplicated = snapshot.duplicated();
     let started = show(snapshot.screens(), None, Some(snapshot), move |state, ctx| {
-        worker(state, ctx, duplicated)
+        worker(state, ctx, duplicated, startup)
     })?;
     if !started {
-        fix::setup()?;
+        fix::setup(startup)?;
     }
     Ok(())
 }
 
-fn worker(state: State, ctx: egui::Context, duplicated: bool) {
+fn worker(state: State, ctx: egui::Context, duplicated: bool, startup: bool) {
     let result = (|| -> Result<(), String> {
         if duplicated {
             log::line("Displays are duplicated; switching to extend.");
@@ -138,26 +140,30 @@ fn worker(state: State, ctx: egui::Context, duplicated: bool) {
             let screens = state.lock().unwrap().screens.clone();
             display::remembered_layout(&screens)
         };
-        match layout {
-            display::StartupLayout::Current => {}
+        let apply_scaling = match layout {
+            display::StartupLayout::Current => startup,
             display::StartupLayout::Remembered => {
                 let pointer = capture_pointer(&state);
                 let result = display::restore_remembered_layout();
                 finish_display_change(&state, &ctx, Phase::Working, pointer);
                 result?;
                 log::line("Restored the Windows layout for these displays.");
+                startup
             }
             display::StartupLayout::Defaults => {
                 let pointer = capture_pointer(&state);
                 let result = fix::arrange(None, false);
                 finish_display_change(&state, &ctx, Phase::Working, pointer);
                 result?;
-                let pointer = capture_pointer(&state);
-                let scaling = fix::scale();
-                finish_display_change(&state, &ctx, Phase::Working, pointer);
-                if scaling? {
-                    fix::refresh_taskbar();
-                }
+                true
+            }
+        };
+        if apply_scaling {
+            let pointer = capture_pointer(&state);
+            let scaling = fix::scale();
+            finish_display_change(&state, &ctx, Phase::Working, pointer);
+            if scaling? {
+                fix::refresh_taskbar();
             }
         }
         Ok(())
@@ -1234,38 +1240,60 @@ fn draw_screen(painter: &Painter, s: &Screen, r: Rect, here: bool, detached: boo
         painter.circle_filled(center + vec2(0.0, radius * 0.43), mark.width * 0.56, BG);
     }
 
+    // Up to three centred lines: "Main Display" in bold, the monitor name, then the details.
     let text_width = (r.width() - 12.0).max(1.0);
-    let name_font = regular(if here { (r.height() * 0.32).clamp(1.0, 12.5) } else { 12.5 });
-    let name = label(painter, &s.name, &name_font, text_width);
-    let name_color = if highlighted { TEXT } else { MUTED };
     let inches = s.mm.map(|(w, h)| (w * w + h * h).sqrt() / 25.4).filter(|d| *d > 5.0 && !s.name.contains(" + "));
-    let detail = match (here, s.primary, inches) {
-        (true, true, Some(d)) => Some((format!("This Display · Main · {d:.0}\""), Color32::LIGHT_GRAY)),
-        (true, true, None) => Some(("This Display · Main".into(), Color32::LIGHT_GRAY)),
-        (true, false, Some(d)) => Some((format!("This Display · {d:.0}\""), Color32::LIGHT_GRAY)),
-        (true, false, None) => Some(("This Display".into(), Color32::LIGHT_GRAY)),
-        (false, true, Some(d)) => Some((format!("Main · {d:.0}\""), if dragging { ACCENT_TEXT } else { MUTED })),
-        (false, true, None) => Some(("Main".into(), if dragging { ACCENT_TEXT } else { MUTED })),
-        (false, false, Some(d)) => Some((format!("{d:.0}\""), MUTED)),
-        (false, false, None) => None,
+    let mut header = s.primary.then(|| ("Main Display".to_owned(), semibold(15.0), if dragging { ACCENT_TEXT } else { TEXT }));
+    let name = (s.name.clone(), regular(12.5), if highlighted { TEXT } else { MUTED });
+    let mut detail = match (here, inches) {
+        (true, Some(d)) => Some((format!("This Display · {d:.0}\""), regular(11.0), Color32::LIGHT_GRAY)),
+        (true, None) => Some(("This Display".to_owned(), regular(11.0), Color32::LIGHT_GRAY)),
+        (false, Some(d)) => Some((format!("{d:.0}\""), semibold(11.0), MUTED)),
+        (false, None) => None,
     };
-    match detail {
-        Some((text, colour)) if here || r.height() > 40.0 => {
-            let spacing = (r.height() * 0.22).min(8.5);
-            painter.text(r.center() - vec2(0.0, spacing), Align2::CENTER_CENTER, name, name_font, name_color);
-            let detail_font = if here {
-                let width = painter.layout_no_wrap(text.clone(), regular(11.0), colour).size().x;
-                regular((11.0 * (text_width / width).min(1.0)).min(r.height() * 0.3).max(1.0))
-            } else {
-                semibold(11.0)
-            };
-            let text = fit(painter, &text, &detail_font, text_width);
-            painter.text(r.center() + vec2(0.0, spacing), Align2::CENTER_CENTER, text, detail_font, colour);
+    let room = r.height() - 6.0;
+    let stack = |header: &Option<Line>, detail: &Option<Line>| -> Vec<Line> {
+        header.iter().chain([&name]).chain(detail.iter()).cloned().collect()
+    };
+    let mut lines = if here {
+        // This card's own screen keeps every line, shrinking them to fit the tile.
+        let mut lines = stack(&header, &detail);
+        let factor = (room / stack_height(painter, &lines)).min(1.0);
+        for (i, (text, font, _)) in lines.iter_mut().enumerate() {
+            let width = painter.layout_no_wrap(text.clone(), font.clone(), TEXT).size().x;
+            // The name is shortened instead (to its brand when that fits); the others shrink.
+            let fit_width = if i == usize::from(s.primary) { 1.0 } else { (text_width / width).min(1.0) };
+            font.size = (font.size * factor.min(fit_width)).max(1.0);
         }
-        _ => {
-            painter.text(r.center(), Align2::CENTER_CENTER, name, name_font, name_color);
+        lines
+    } else {
+        // Other screens drop the details, then the header, when the tile is too short.
+        if stack_height(painter, &stack(&header, &detail)) > room {
+            detail = None;
         }
+        if stack_height(painter, &stack(&header, &detail)) > room {
+            header = None;
+        }
+        stack(&header, &detail)
+    };
+    for (i, (text, font, _)) in lines.iter_mut().enumerate() {
+        let is_name = i == usize::from(header.is_some());
+        *text = if is_name { label(painter, text, font, text_width) } else { fit(painter, text, font, text_width) };
     }
+    let mut y = r.center().y - stack_height(painter, &lines) / 2.0;
+    for (text, font, color) in lines {
+        let height = painter.layout_no_wrap(text.clone(), font.clone(), color).size().y;
+        painter.text(pos2(r.center().x, y + height / 2.0), Align2::CENTER_CENTER, text, font, color);
+        y += height + LINE_GAP;
+    }
+}
+
+type Line = (String, FontId, Color32);
+const LINE_GAP: f32 = 1.0;
+
+fn stack_height(painter: &Painter, lines: &[Line]) -> f32 {
+    let rows: f32 = lines.iter().map(|(text, font, color)| painter.layout_no_wrap(text.clone(), font.clone(), *color).size().y).sum();
+    rows + LINE_GAP * lines.len().saturating_sub(1) as f32
 }
 
 fn button(ui: &egui::Ui, painter: &Painter, rect: Rect, id: &str, label: &str, primary: bool, enabled: bool) -> egui::Response {
@@ -1905,7 +1933,9 @@ mod tests {
         let (output, _) = frame(vec![], &mut card.edit);
         text_center(&output, "Display Preview");
         text_center(&output, "Drag displays until correct. Right-click to set main display and scaling");
-        assert!(text_center(&output, "This Display · Main · 27\"").y > text_center(&output, &screens[1].name).y);
+        let name = text_center(&output, &screens[1].name).y;
+        assert!(text_center(&output, "Main Display").y < name);
+        assert!(text_center(&output, "This Display · 27\"").y > name);
         let tile = screen_rects(&output)[1].center();
         frame(vec![Event::PointerMoved(tile), mouse(tile, PointerButton::Secondary, true)], &mut card.edit);
         frame(vec![mouse(tile, PointerButton::Secondary, false)], &mut card.edit);

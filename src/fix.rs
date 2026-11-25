@@ -12,10 +12,14 @@ pub fn if_duplicate() -> Result<bool, String> {
     Ok(true)
 }
 
-/// Prepare the desktop if the on-screen card cannot start.
-pub fn setup() -> Result<(), String> {
+/// Prepare the desktop if the on-screen card cannot start. `apply_scaling` applies the configured
+/// scaling even when Windows already has a layout for these displays (the first setup after sign-in).
+pub fn setup(apply_scaling: bool) -> Result<(), String> {
     if !if_duplicate()? {
         setup_current_layout()?;
+    }
+    if apply_scaling && scale()? {
+        refresh_taskbar();
     }
     Ok(())
 }

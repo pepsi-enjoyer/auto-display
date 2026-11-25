@@ -59,8 +59,9 @@ fn main() {
             println!("auto-display {}", update::CURRENT);
             Ok(())
         }
-        // "setup" is what watchers before 0.3 start; one may still be running across an update.
-        "" | "setup" => ui::run(),
+        // "setup" is what the watcher starts for the first card after sign-in.
+        "" => ui::run(false),
+        "setup" => ui::run(config::load().apply_scaling_at_sign_in),
         "layout" => fix::apply_layout().map(|_| ()),
         "taskbar" => shell::restart_explorer(),
         "laptop" => match args.get(1).map(String::as_str) {

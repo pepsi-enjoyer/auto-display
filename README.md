@@ -45,7 +45,7 @@ Downloads the [latest release](https://github.com/pepsi-enjoyer/auto-display/rel
   <img src="docs/how-it-works.svg" alt="How auto-display works: Dock or Sign In, Extend and Restore, Preview and Keep" width="100%">
 </p>
 
-- **First multi-screen setup after boot:** Arranges your displays and opens the Display Preview card on every screen, duplicated or not.
+- **First multi-screen setup after sign-in:** Arranges your displays, applies the scaling from `config.toml` (unless `apply_scaling_at_sign_in = false`), and opens the Display Preview card on every screen, duplicated or not.
 - **Later docks:** Silently switches back to extend if plugging in a monitor leaves displays duplicated (no card).
 - **Manual duplicate mode:** If you switch to Duplicate yourself later (for example, to present), `auto-display` leaves it alone.
 - **Auto-updates:** Checks GitHub 1 minute after sign-in and every 6 hours, verifies the download, and restarts the watcher without changing your layout.
@@ -84,6 +84,7 @@ Run `auto-display config` to create and print the path to your settings file (`%
 ```toml
 external_scale = 150      # scaling for a 4K external monitor (%)
 # laptop_scale = 250      # scaling for the laptop screen; omit to keep Windows' choice
+apply_scaling_at_sign_in = true  # set to false to keep Windows' remembered scaling at sign-in
 auto_update = true        # set to false to disable automatic updates
 restart_explorer = true   # set to false to keep Explorer running after scaling changes
 ```

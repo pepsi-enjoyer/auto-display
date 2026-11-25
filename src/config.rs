@@ -20,6 +20,10 @@ external_scale = 150
 # Scaling for the laptop screen. Leave commented out to keep what Windows chose.
 # laptop_scale = 250
 
+# Apply the scaling above the first time the displays are set up after you sign in, even when
+# Windows already has a layout for them. Set to false to keep the scaling Windows remembers.
+apply_scaling_at_sign_in = true
+
 # Check GitHub for updates automatically.
 auto_update = true
 
@@ -33,13 +37,20 @@ restart_explorer = true
 pub struct Config {
     pub external_scale: Option<u32>,
     pub laptop_scale: Option<u32>,
+    pub apply_scaling_at_sign_in: bool,
     pub auto_update: bool,
     pub restart_explorer: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { external_scale: Some(150), laptop_scale: None, auto_update: true, restart_explorer: true }
+        Config {
+            external_scale: Some(150),
+            laptop_scale: None,
+            apply_scaling_at_sign_in: true,
+            auto_update: true,
+            restart_explorer: true,
+        }
     }
 }
 
@@ -95,7 +106,7 @@ mod tests {
     #[test]
     fn reads_both_scales() {
         let c = parse("external_scale = 125\nlaptop_scale = 200\n").unwrap();
-        assert_eq!(c, Config { external_scale: Some(125), laptop_scale: Some(200), auto_update: true, restart_explorer: true });
+        assert_eq!(c, Config { external_scale: Some(125), laptop_scale: Some(200), ..Config::default() });
     }
 
     #[test]
@@ -104,6 +115,8 @@ mod tests {
         assert!(!parse("auto_update = false\n").unwrap().auto_update);
         assert!(parse("external_scale = 150\n").unwrap().restart_explorer);
         assert!(!parse("restart_explorer = false\n").unwrap().restart_explorer);
+        assert!(parse("external_scale = 150\n").unwrap().apply_scaling_at_sign_in);
+        assert!(!parse("apply_scaling_at_sign_in = false\n").unwrap().apply_scaling_at_sign_in);
     }
 
     #[test]
